@@ -1,5 +1,7 @@
 # Container Profiler
 
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/) [![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows)](https://github.com/calvinhoisgood/container-profiler/releases) [![Latest Release](https://img.shields.io/github/v/release/calvinhoisgood/container-profiler)](https://github.com/calvinhoisgood/container-profiler/releases/latest)
+
 面向深度學習負載的 Windows 桌面端 Docker 容器運行時監控工具。它將容器資源、CPU/GPU 功耗與實時曲線集中到一個 PyQt6 圖形界面中，並可將採樣結果導出為 CSV，便於性能分析與畢業論文實驗。
 
 ## 功能特性
@@ -41,6 +43,10 @@ NVIDIA GPU ── NVML ──────────┘
 - NVIDIA 驅動及受 NVML 支持的顯卡（GPU 指標可選）
 
 沒有 HWiNFO 或 NVIDIA GPU 時，對應功耗指標不可用，但容器基礎監控仍可使用。
+
+## 下載 Windows 版
+
+不想配置 Python 環境時，可直接前往 [GitHub Releases](https://github.com/calvinhoisgood/container-profiler/releases/latest) 下載 ContainerProfiler-v1.0.0-windows-x64.exe。啟動監控前仍需確保 Docker Desktop 已運行；CPU 功耗與 GPU 指標分別需要 HWiNFO64 和受支持的 NVIDIA 顯卡。
 
 ## 快速開始
 

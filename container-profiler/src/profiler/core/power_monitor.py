@@ -39,7 +39,7 @@ CloseHandle.restype = wintypes.BOOL
 class HWiNFOReader:
     """HWiNFO 共享內存讀取器"""
     
-    HWINFO_SENSORS_SM_NAME = "Global\HWiNFO_SENS_SM2"
+    HWINFO_SENSORS_SM_NAME = r"Global\HWiNFO_SENS_SM2"
     
     def __init__(self):
         self.hMap = None

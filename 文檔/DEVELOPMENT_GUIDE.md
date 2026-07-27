@@ -50,7 +50,7 @@ ContainerProfiler.exe (約 120-150 MB)
 | GUI 框架 | PyQt6 | 6.6+ | 桌面界面 |
 | 圖表庫 | PyQtGraph | 0.13+ | 實時曲線 |
 | Docker | docker-py | 7.0+ | 容器 API |
-| GPU | pynvml | 11.5+ | NVIDIA 監控 |
+| GPU | nvidia-ml-py (`pynvml`) | 12.0+ | NVIDIA 監控 |
 | 打包 | PyInstaller | 6.0+ | exe 生成 |
 
 ### 2.2 系統架構圖
@@ -176,7 +176,7 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 
 # 3. 安裝依賴
-pip install PyQt6 pyqtgraph docker pynvml construct pyinstaller
+pip install PyQt6 pyqtgraph docker nvidia-ml-py construct pyinstaller
 pip freeze > requirements.txt
 ```
 
