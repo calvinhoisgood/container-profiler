@@ -46,7 +46,7 @@ NVIDIA GPU ── NVML ──────────┘
 
 ## 下載 Windows 版
 
-不想配置 Python 環境時，可直接前往 [GitHub Releases](https://github.com/calvinhoisgood/container-profiler/releases/latest) 下載 ContainerProfiler-v1.0.0-windows-x64.exe。啟動監控前仍需確保 Docker Desktop 已運行；CPU 功耗與 GPU 指標分別需要 HWiNFO64 和受支持的 NVIDIA 顯卡。
+不想配置 Python 環境時，可直接前往 [GitHub Releases](https://github.com/calvinhoisgood/container-profiler/releases/latest) 下載 ContainerProfiler-v1.0.1-windows-x64.exe。啟動監控前仍需確保 Docker Desktop 已運行；CPU 功耗與 GPU 指標分別需要 HWiNFO64 和受支持的 NVIDIA 顯卡。
 
 ## 快速開始
 
