@@ -1,0 +1,6 @@
+PyQt6
+pyqtgraph
+docker
+pynvml
+construct
+pyinstaller
