@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 from ..core.data_manager import DataManager
 from ..core.docker_monitor import DockerMonitor
 from ..core.power_monitor import PowerMonitor
+from ..core.self_telemetry import AgentSelfTelemetry, advance_fixed_rate_deadline
 from ..utils.paths import get_output_dir
 from .chart_widget import ChartWidget
 from .container_list import ContainerListWidget
@@ -32,6 +33,7 @@ class WorkerThread(QThread):
     """Collect blocking Docker/sensor data outside the GUI thread."""
 
     data_ready = pyqtSignal(str, object, object)
+    health_ready = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
 
     def __init__(
@@ -46,25 +48,52 @@ class WorkerThread(QThread):
         self.power_monitor = power_monitor
         self.container_id = container_id
         self.interval_ms = interval_ms
+        self.telemetry = AgentSelfTelemetry(interval_s=interval_ms / 1000.0)
+
+    def _sleep_until(self, deadline: float) -> None:
+        while not self.isInterruptionRequested():
+            remaining_ms = int((deadline - time.monotonic()) * 1000.0)
+            if remaining_ms <= 0:
+                return
+            self.msleep(min(50, remaining_ms))
 
     def run(self) -> None:
+        interval_s = self.interval_ms / 1000.0
+        deadline = time.monotonic()
+        cycle_count = 0
+
         while not self.isInterruptionRequested():
             started = time.monotonic()
             stats = self.docker_monitor.get_stats(self.container_id)
+            power_stats = self.power_monitor.get_power_stats() if stats is not None else None
+            finished = time.monotonic()
+
+            self.telemetry.record_cycle(
+                scheduled_at=deadline,
+                started_at=started,
+                finished_at=finished,
+                success=stats is not None,
+            )
+            cycle_count += 1
+
             if stats is None:
+                self.health_ready.emit(self.telemetry.snapshot())
                 detail = self.docker_monitor.last_error or "容器可能已停止"
                 self.error_occurred.emit(f"獲取容器數據失敗: {detail}")
                 return
 
-            power_stats = self.power_monitor.get_power_stats()
             self.data_ready.emit(self.container_id, stats, power_stats)
 
-            elapsed_ms = (time.monotonic() - started) * 1000.0
-            remaining_ms = max(0, int(self.interval_ms - elapsed_ms))
-            while remaining_ms > 0 and not self.isInterruptionRequested():
-                chunk = min(50, remaining_ms)
-                self.msleep(chunk)
-                remaining_ms -= chunk
+            deadline, skipped = advance_fixed_rate_deadline(deadline, finished, interval_s)
+            if skipped:
+                self.telemetry.record_skipped_ticks(skipped)
+
+            if skipped or cycle_count % 10 == 0:
+                self.health_ready.emit(self.telemetry.snapshot())
+
+            self._sleep_until(deadline)
+
+        self.health_ready.emit(self.telemetry.snapshot())
 
     def stop(self, timeout_ms: int = 3000) -> bool:
         self.requestInterruption()
@@ -85,6 +114,7 @@ class MainWindow(QMainWindow):
         self.selected_container_id: str | None = None
         self.monitoring_container_id: str | None = None
         self.worker_thread: WorkerThread | None = None
+        self.last_health_snapshot = None
 
         self._setup_ui()
         self._setup_style()
@@ -125,10 +155,14 @@ class MainWindow(QMainWindow):
 
         self.monitoring_container_id = self.selected_container_id
         self.docker_monitor.reset_container_baseline(self.monitoring_container_id)
-        self.data_manager.start_recording()
-        self.chart_widget.reset()
-
         interval = self.interval_spin.value()
+        self.data_manager.start_recording(
+            container_id=self.monitoring_container_id,
+            target_interval_ms=interval,
+        )
+        self.chart_widget.reset()
+        self.last_health_snapshot = None
+
         worker = WorkerThread(
             self.docker_monitor,
             self.power_monitor,
@@ -136,6 +170,7 @@ class MainWindow(QMainWindow):
             interval,
         )
         worker.data_ready.connect(self._handle_new_data)
+        worker.health_ready.connect(self._handle_health)
         worker.error_occurred.connect(self._handle_monitor_error)
         self.worker_thread = worker
         worker.start()
@@ -154,6 +189,8 @@ class MainWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             if not worker.stop():
                 status_message = "採樣線程仍在等待底層調用返回，稍後再退出"
+        if worker is not None:
+            self.last_health_snapshot = worker.telemetry.snapshot()
 
         self.data_manager.stop_recording()
         self.start_btn.setChecked(False)
@@ -164,6 +201,8 @@ class MainWindow(QMainWindow):
         self.monitoring_container_id = None
         if status_message is None:
             status_message = f"監控已停止 | 已記錄 {len(self.data_manager.recorded_data)} 條數據"
+            if self.last_health_snapshot is not None:
+                status_message += f" | skipped {self.last_health_snapshot.skipped_ticks}"
         self.statusBar().showMessage(status_message)
 
     def _handle_new_data(self, container_id: str, stats, power_stats) -> None:
@@ -172,6 +211,19 @@ class MainWindow(QMainWindow):
         self.data_manager.add_record(container_id, stats, power_stats)
         self.metrics_panel.update_metrics(stats, power_stats)
         self.chart_widget.update_data(stats, power_stats)
+
+    def _handle_health(self, snapshot) -> None:
+        self.last_health_snapshot = snapshot
+        if not self.monitoring_container_id:
+            return
+        latency = snapshot.collection_latency_ms_p95
+        lag = snapshot.scheduling_lag_ms_p95
+        latency_text = "-" if latency is None else f"{latency:.1f}ms"
+        lag_text = "-" if lag is None else f"{lag:.1f}ms"
+        self.statusBar().showMessage(
+            f"監控 {self.monitoring_container_id[:12]} | collect p95 {latency_text} | "
+            f"lag p95 {lag_text} | skipped {snapshot.skipped_ticks} | failures {snapshot.failed_cycles}"
+        )
 
     def _handle_monitor_error(self, error_msg: str) -> None:
         self._stop_monitoring(error_msg)
@@ -189,7 +241,13 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         if self.data_manager.export_csv(file_path):
-            QMessageBox.information(self, "成功", f"數據已導出至:\n{file_path}")
+            summary_path = f"{file_path}.summary.json"
+            self.data_manager.export_summary_json(summary_path)
+            QMessageBox.information(
+                self,
+                "成功",
+                f"數據已導出至:\n{file_path}\n摘要:\n{summary_path}",
+            )
         else:
             QMessageBox.critical(self, "錯誤", "導出失敗")
 
