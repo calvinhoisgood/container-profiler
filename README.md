@@ -1,46 +1,42 @@
 # Container Profiler
-只用於個人保存
-面向深度學習負載的 Windows 桌面端 Docker 容器運行時監控工具。它將容器資源、CPU/GPU 功耗與實時曲線集中到一個 PyQt6 圖形界面中，並可將採樣結果導出為 CSV，便於性能分析與畢業論文實驗。
 
-## 功能特性
+只用於個人保存。
 
-- 瀏覽本機全部 Docker 容器及其運行狀態
-- 實時監控容器 CPU、內存與網絡 I/O
-- 通過 HWiNFO 共享內存讀取 CPU Package Power
-- 通過 NVIDIA NVML 讀取 GPU 功耗、利用率、顯存與溫度
-- 使用 PyQtGraph 展示可切換、可縮放的實時曲線
-- 自定義採樣間隔，開始或停止監控任務
-- 將採樣結果導出為 UTF-8 CSV 文件
-- 使用 PyInstaller 打包為獨立 Windows 可執行文件
+面向深度學習／推理負載的 Windows Docker 桌面監控工具。v5 不再只是往 v4 疊功能，而是把採樣核心重新拆成可測試的資料模型、Docker 採樣、功耗採樣、資料記錄與 GUI 幾層，優先修正數值語義、平台耦合和缺乏測試的問題。
 
-## 界面與數據流
+## v5 主要改動
+
+- Docker SDK 改為延遲載入，因此沒有 Docker 的機器仍可導入核心模組和跑單元測試。
+- CPU 使用率兼容 `online_cpus` 缺失；內存改為優先扣除可回收 `inactive_file`，更接近容器工作集語義。
+- 網絡不再把累積 bytes 當成速率；現在基於相鄰採樣計算 `network_rx_bps` / `network_tx_bps`。
+- `None` 明確代表「傳感器不可用」，不再與真實的 `0 W` / `0 %` 混為一談；CSV 同樣保留差別。
+- HWiNFO Windows API 不再於 import 階段初始化，因此非 Windows 平台可安全導入；共享內存讀取加入元素大小／數量保護。
+- NVML 支持依賴注入，沒有 NVIDIA GPU 也能做確定性單元測試。
+- 採樣線程改用 Qt interruption 機制並分段睡眠，停止監控／退出更容易及時響應。
+- 圖表不再把 CPU 百分比和 Memory MB 放到同一 Y 軸；改為 CPU/Memory%、Power、GPU%、Network MiB/s 四個模式。
+- CSV 新增 elapsed、內存百分比、網絡速率、PID、GPU 總顯存與溫度等欄位。
+- 新增硬件無關單元測試，以及 Windows/Linux、Python 3.11/3.13 的 GitHub Actions 測試矩陣。
+
+## 數據流
 
 ```text
-Docker Engine ── Docker SDK ─┐
-                             ├─> 採樣工作線程 ─> 指標卡片 / 實時曲線 ─> CSV
-HWiNFO ── Windows 共享內存 ──┤
-NVIDIA GPU ── NVML ──────────┘
+Docker Engine ──> DockerMonitor ──────┐
+                                      ├─> WorkerThread ─> UI / Chart ─> DataManager ─> CSV
+HWiNFO Shared Memory ─> HWiNFOReader ─┤
+NVIDIA NVML ──────────> NVMLReader ───┘
 ```
 
-核心模塊分工：
-
-| 模塊 | 職責 |
-| --- | --- |
-| `core/docker_monitor.py` | 容器發現及 CPU、內存、網絡數據採集 |
-| `core/power_monitor.py` | HWiNFO CPU 功耗與 NVML GPU 指標採集 |
-| `core/data_manager.py` | 採樣數據緩存及 CSV 導出 |
-| `gui/` | 主窗口、容器列表、指標面板與實時圖表 |
-| `utils/paths.py` | 源碼和 PyInstaller 打包環境下的路徑解析 |
+`ContainerStats` 和 `PowerStats` 是核心資料契約。GUI 只消費結構化採樣，不直接碰 Docker、HWiNFO 或 NVML。
 
 ## 運行環境
 
 - Windows 10/11
-- Python 3.11 或更高版本
+- Python 3.11+
 - Docker Desktop（容器監控必需）
-- HWiNFO64，並啟用 **Sensors-only > Shared Memory Support**（CPU 功耗可選）
-- NVIDIA 驅動及受 NVML 支持的顯卡（GPU 指標可選）
+- HWiNFO64，並啟用 Sensors-only / Shared Memory Support（CPU Package Power，可選）
+- NVIDIA 驅動及 NVML 支持顯卡（GPU 指標，可選）
 
-沒有 HWiNFO 或 NVIDIA GPU 時，對應功耗指標不可用，但容器基礎監控仍可使用。
+HWiNFO 或 NVIDIA GPU 缺失時，對應欄位顯示為不可用，其餘容器監控仍可工作。
 
 ## 快速開始
 
@@ -55,80 +51,48 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-啟動前請確認 Docker Desktop 已運行。若需 CPU 功耗數據，請同時以 Sensors-only 模式啟動 HWiNFO64 並開啟共享內存支持。
+## 採樣週期的含義
 
-## 打包 Windows 程序
+GUI 裡的採樣週期是「目標週期」，不是硬實時保證。每輪先完成 Docker 和功耗採樣，再等待剩餘時間；如果一次底層採樣已經超過目標週期，下一輪會立即開始而不額外等待。因此後續分析應以 CSV 的真實 `timestamp` / `elapsed_s` 為時間基準。
 
-在 `container-profiler` 目錄中執行：
-
-```powershell
-pyinstaller --clean build.spec
-```
-
-生成的可執行文件位於 `dist/ContainerProfiler_v4.exe`。構建產物不提交到 Git；正式二進制版本應通過 GitHub Releases 發佈。
-
-## 導出字段
-
-CSV 目前包含以下字段：
+## CSV 欄位
 
 ```text
-timestamp, container_id, cpu_percent, memory_mb,
-network_rx, network_tx, cpu_power_w, gpu_power_w,
-gpu_util, gpu_memory_mb
+timestamp, elapsed_s, container_id,
+cpu_percent,
+memory_mb, memory_limit_mb, memory_percent,
+network_rx_bytes, network_tx_bytes, network_rx_bps, network_tx_bps,
+pids,
+cpu_power_w,
+gpu_power_w, gpu_util_percent,
+gpu_memory_mb, gpu_memory_total_mb, gpu_temp_c
 ```
 
-## 項目結構
+第一個網絡採樣沒有前一個基線，因此速率欄位留空，而不是偽造為 0。
 
-```text
-JNUFINAL/
-├── container-profiler/
-│   ├── main.py
-│   ├── requirements.txt
-│   ├── build.spec
-│   ├── resources/
-│   ├── src/profiler/
-│   │   ├── core/
-│   │   ├── gui/
-│   │   └── utils/
-│   └── tests/
-├── 文檔/
-│   ├── AI_WORKFLOW.md
-│   ├── DEVELOPMENT_GUIDE.md
-│   └── LOG.md
-└── 參考代碼/
-```
+## 測試
 
-## 驗證
-
-不依賴硬件的語法檢查：
-
-```powershell
-python -m compileall -q container-profiler
-```
-
-Docker 集成冒煙測試：
+無 Docker、無 HWiNFO、無 NVIDIA GPU 也能跑核心單元測試：
 
 ```powershell
 cd container-profiler
+python -m unittest discover -s tests -p "test_*_unit.py" -v
+python -m compileall -q src tests
+```
+
+有 Docker Desktop 和運行中容器時，再執行真實環境冒煙測試：
+
+```powershell
 python tests/test_docker_core.py
 ```
 
-該測試需要已運行的 Docker Desktop 和至少一個可供採樣的容器。
-
 ## 已知限制
 
-- 目前以 Windows 為主要運行平台，HWiNFO 功耗採集依賴 Windows 共享內存。
-- GPU 指標僅支持 NVIDIA NVML。
-- 現有測試為本機 Docker 集成冒煙測試，尚未建立完整的自動化單元測試。
-- HWiNFO 共享內存結構可能隨版本變化，升級 HWiNFO 後應重新驗證功耗讀數。
-
-## 文檔
-
-- [完整開發指南](文檔/DEVELOPMENT_GUIDE.md)
-- [AI 協作流程](文檔/AI_WORKFLOW.md)
-- [開發日誌](文檔/LOG.md)
+- HWiNFO CPU 功耗仍依賴 Windows 共享內存及 HWiNFO 提供的欄位名稱。
+- GPU 指標目前仍只有 NVIDIA NVML，尚未加入 AMD／Intel GPU 後端。
+- 無硬件單元測試能驗證計算、解析、缺失依賴與 CSV 語義，但不能替代 Windows + Docker Desktop + HWiNFO + NVIDIA 的完整實機驗證。
+- Docker 採樣延遲由 Docker Engine／宿主環境決定；把 GUI 設成 20 ms 不代表 Engine 真能提供 50 Hz 的新鮮統計。
 
 ## 項目背景
 
-本項目服務於「面向深度學習負載的容器運行時畫像與工具集構建」畢業設計，目標是以低門檻桌面工具採集容器及硬件運行數據，為不同模型、推理框架與部署配置的性能和能耗比較提供可復現的數據基礎。
-
+本項目服務於「面向深度學習負載的容器運行時畫像與工具集構建」畢業設計。v5 的重點不是讓 GUI 看起來更複雜，而是讓採樣結果可以被解釋、重現、測試，並且在傳感器缺失或平台不同時清楚地失敗。
