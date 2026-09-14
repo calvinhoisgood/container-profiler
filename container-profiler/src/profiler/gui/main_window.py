@@ -23,10 +23,12 @@ from ..core.data_manager import DataManager
 from ..core.docker_monitor import DockerMonitor
 from ..core.power_monitor import PowerMonitor
 from ..core.self_telemetry import AgentSelfTelemetry, advance_fixed_rate_deadline
-from ..utils.paths import get_output_dir
+from ..core.storage import SQLiteTelemetryStore
+from ..utils.paths import get_output_dir, get_telemetry_db_path
 from .chart_widget import ChartWidget
 from .container_list import ContainerListWidget
 from .metrics_panel import MetricsPanel
+from .session_history import SessionHistoryDialog
 
 
 class WorkerThread(QThread):
@@ -109,7 +111,13 @@ class MainWindow(QMainWindow):
 
         self.docker_monitor = DockerMonitor()
         self.power_monitor = PowerMonitor()
-        self.data_manager = DataManager()
+        self.telemetry_store: SQLiteTelemetryStore | None = None
+        self.storage_init_error: str | None = None
+        try:
+            self.telemetry_store = SQLiteTelemetryStore(get_telemetry_db_path())
+        except Exception as exc:
+            self.storage_init_error = str(exc)
+        self.data_manager = DataManager(store=self.telemetry_store)
 
         self.selected_container_id: str | None = None
         self.monitoring_container_id: str | None = None
@@ -124,6 +132,7 @@ class MainWindow(QMainWindow):
         self.container_list.container_selected.connect(self._on_container_selected)
         self.start_btn.clicked.connect(self._toggle_monitoring)
         self.export_btn.clicked.connect(self._export_data)
+        self.history_btn.clicked.connect(self._show_history)
         self._refresh_container_list()
 
     @property
@@ -203,6 +212,8 @@ class MainWindow(QMainWindow):
             status_message = f"監控已停止 | 已記錄 {len(self.data_manager.recorded_data)} 條數據"
             if self.last_health_snapshot is not None:
                 status_message += f" | skipped {self.last_health_snapshot.skipped_ticks}"
+            if self.data_manager.last_storage_error:
+                status_message += " | 本機持久化失敗"
         self.statusBar().showMessage(status_message)
 
     def _handle_new_data(self, container_id: str, stats, power_stats) -> None:
@@ -220,13 +231,25 @@ class MainWindow(QMainWindow):
         lag = snapshot.scheduling_lag_ms_p95
         latency_text = "-" if latency is None else f"{latency:.1f}ms"
         lag_text = "-" if lag is None else f"{lag:.1f}ms"
+        storage_text = ""
+        if self.data_manager.last_storage_error:
+            storage_text = " | storage degraded"
         self.statusBar().showMessage(
             f"監控 {self.monitoring_container_id[:12]} | collect p95 {latency_text} | "
-            f"lag p95 {lag_text} | skipped {snapshot.skipped_ticks} | failures {snapshot.failed_cycles}"
+            f"lag p95 {lag_text} | skipped {snapshot.skipped_ticks} | "
+            f"failures {snapshot.failed_cycles}{storage_text}"
         )
 
     def _handle_monitor_error(self, error_msg: str) -> None:
         self._stop_monitoring(error_msg)
+
+    def _show_history(self) -> None:
+        if self.telemetry_store is None:
+            detail = self.storage_init_error or "本機資料庫不可用"
+            QMessageBox.warning(self, "監控歷史不可用", detail)
+            return
+        dialog = SessionHistoryDialog(self.telemetry_store, self)
+        dialog.exec()
 
     def _export_data(self) -> None:
         if not self.data_manager.recorded_data:
@@ -292,12 +315,17 @@ class MainWindow(QMainWindow):
             """
         )
 
+        self.history_btn = QPushButton("監控歷史")
+        self.history_btn.setEnabled(self.telemetry_store is not None)
+        self.history_btn.setToolTip(str(get_telemetry_db_path()))
+
         control_layout.addWidget(self.start_btn)
         control_layout.addSpacing(10)
         control_layout.addWidget(QLabel("目標週期:"))
         control_layout.addWidget(self.interval_spin)
         control_layout.addSpacing(10)
         control_layout.addWidget(self.export_btn)
+        control_layout.addWidget(self.history_btn)
         control_layout.addStretch()
         right_layout.addLayout(control_layout)
 
@@ -314,7 +342,8 @@ class MainWindow(QMainWindow):
         docker = "已連接" if self.docker_monitor.is_connected() else "未連接"
         nvml = "GPU已就緒" if self.power_monitor.nvml.is_available() else "GPU不可用"
         hwinfo = "HWiNFO已就緒" if self.power_monitor.hwinfo.is_connected() else "HWiNFO不可用"
-        self.statusBar().showMessage(f"Docker: {docker} | {nvml} | {hwinfo}")
+        storage = "SQLite已就緒" if self.telemetry_store is not None else "SQLite不可用"
+        self.statusBar().showMessage(f"Docker: {docker} | {nvml} | {hwinfo} | {storage}")
         self.statusBar().setStyleSheet("color: #FFFFFF; background-color: #007ACC;")
 
     def _setup_style(self) -> None:
@@ -323,8 +352,8 @@ class MainWindow(QMainWindow):
             QMainWindow { background-color: #1E1E1E; }
             QWidget { color: #FFFFFF; font-family: 'Segoe UI', Arial; }
             QSplitter::handle { background-color: #3D3D3D; }
-            QListWidget { background-color: #252526; border: 1px solid #3D3D3D; border-radius: 4px; }
-            QListWidget::item:selected { background-color: #094771; color: #FFFFFF; }
+            QListWidget, QTableWidget { background-color: #252526; border: 1px solid #3D3D3D; border-radius: 4px; }
+            QListWidget::item:selected, QTableWidget::item:selected { background-color: #094771; color: #FFFFFF; }
             QComboBox, QSpinBox { background-color: #2D2D2D; color: #FFFFFF; border: 1px solid #3D3D3D; border-radius: 4px; padding: 4px; }
             QComboBox QAbstractItemView { background-color: #2D2D2D; color: #FFFFFF; selection-background-color: #094771; }
             QLabel { color: #FFFFFF; }
@@ -334,5 +363,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.worker_thread is not None:
             self._stop_monitoring("正在退出")
+        self.data_manager.close()
         self.power_monitor.close()
         event.accept()
