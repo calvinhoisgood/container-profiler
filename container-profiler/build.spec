@@ -1,53 +1,46 @@
 # -*- mode: python ; coding: utf-8 -*-
-import sys
-import os
+from pathlib import Path
 
-# Define src path
-src_path = os.path.abspath('src')
+src_path = Path("src").resolve()
+resources = Path("resources")
+datas = []
+if resources.exists():
+    datas.append((str(resources), "resources"))
 
-block_cipher = None
+hiddenimports = [
+    "PyQt6.sip",
+    "pyqtgraph",
+    "docker",
+    "pynvml",
+    "requests",
+    "websocket",
+    "urllib3",
+]
 
 a = Analysis(
-    ['main.py'],
-    pathex=[src_path],
+    ["main.py"],
+    pathex=[str(src_path)],
     binaries=[],
-    # FORCE copy the profiler package source to the bundle root
-    datas=[
-        ('resources', 'resources'),
-        ('src/profiler', 'profiler')
-    ],
-    hiddenimports=[
-        'PyQt6.sip',
-        'pyqtgraph',
-        'docker',
-        'pynvml',
-        'construct',
-        'requests', 
-        'websocket',
-        'urllib3',
-    ],
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=['matplotlib', 'tkinter', 'PIL'],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    excludes=["matplotlib", "tkinter", "PIL"],
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
-    name='ContainerProfiler_v4',
+    name="ContainerProfiler_v5",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False, 
-    # icon='resources/icon.ico', # Icon removed as it is missing
+    console=False,
+    icon=str(resources / "icon.ico") if (resources / "icon.ico").exists() else None,
 )
