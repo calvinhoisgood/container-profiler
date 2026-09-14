@@ -10,7 +10,12 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from profiler.core.discovery import DockerEventWatcher, extract_container_metadata, normalize_container_event
+from profiler.core.discovery import (
+    DockerEventWatcher,
+    ReconnectBackoff,
+    extract_container_metadata,
+    normalize_container_event,
+)
 from profiler.core.docker_monitor import DockerMonitor
 
 
@@ -130,6 +135,25 @@ class DiscoveryTests(unittest.TestCase):
         watcher.run(seen.append)
         self.assertEqual(seen[0].action, "start")
         self.assertEqual(client.event_calls, [{"decode": True, "filters": {"type": "container"}}])
+
+    def test_reconnect_backoff_is_bounded_and_resettable(self):
+        backoff = ReconnectBackoff(initial_s=0.25, maximum_s=1.0, factor=2.0)
+        self.assertEqual(
+            [backoff.next_delay() for _ in range(5)],
+            [0.25, 0.5, 1.0, 1.0, 1.0],
+        )
+        backoff.reset()
+        self.assertEqual(backoff.next_delay(), 0.25)
+
+    def test_reconnect_backoff_rejects_invalid_policy(self):
+        for kwargs in (
+            {"initial_s": 0},
+            {"initial_s": 2, "maximum_s": 1},
+            {"factor": 1},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    ReconnectBackoff(**kwargs)
 
 
 if __name__ == "__main__":
