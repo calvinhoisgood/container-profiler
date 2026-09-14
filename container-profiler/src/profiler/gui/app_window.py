@@ -4,14 +4,19 @@ from __future__ import annotations
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QMessageBox, QToolBar
 
+from ..core.alert_runtime import AlertRuntime
+from ..core.alerting import AlertStatus
+from ..utils.paths import get_alert_config_path
 from .main_window import MainWindow
 from .workload_explorer import WorkloadExplorerDialog
 
 
 class AppMainWindow(MainWindow):
-    """Full desktop window with container workload inspection tools."""
+    """Full desktop window with workload inspection and local alerting."""
 
     def __init__(self) -> None:
+        self.alert_runtime = AlertRuntime(get_alert_config_path())
+        self._last_alert_config_error = self.alert_runtime.last_config_error
         super().__init__()
         self._setup_workload_toolbar()
 
@@ -26,11 +31,83 @@ class AppMainWindow(MainWindow):
         self.workload_action.triggered.connect(self._show_workload_explorer)
         toolbar.addAction(self.workload_action)
 
+        self.alert_action = QAction(self)
+        self.alert_action.setToolTip(
+            f"告警配置: {get_alert_config_path()}\n點擊強制重新載入"
+        )
+        self.alert_action.triggered.connect(self._reload_alerts)
+        toolbar.addAction(self.alert_action)
+        self._refresh_alert_action()
+
         # MainWindow already consumes this signal for status/selection state.
         # The second listener only updates feature availability.
         self.container_list.container_selected.connect(
             lambda container_id: self.workload_action.setEnabled(bool(container_id))
         )
+
+    def _refresh_alert_action(self) -> None:
+        snapshot = self.alert_runtime.snapshot()
+        firing = sum(
+            1 for status in snapshot.states.values() if status == AlertStatus.FIRING
+        )
+        pending = sum(
+            1 for status in snapshot.states.values() if status == AlertStatus.PENDING
+        )
+        if snapshot.last_config_error:
+            self.alert_action.setText("告警配置錯誤")
+        else:
+            self.alert_action.setText(
+                f"告警 {firing} firing / {pending} pending / {snapshot.rule_count} rules"
+            )
+
+    def _reload_alerts(self) -> None:
+        installed = self.alert_runtime.reload(force=True)
+        self._last_alert_config_error = self.alert_runtime.last_config_error
+        self._refresh_alert_action()
+        if self.alert_runtime.last_config_error:
+            QMessageBox.warning(
+                self,
+                "告警配置無效",
+                "已保留上一個可用規則集。\n\n"
+                f"{self.alert_runtime.last_config_error}",
+            )
+        elif installed:
+            QMessageBox.information(
+                self,
+                "告警配置",
+                f"已載入 {len(self.alert_runtime.engine.rules)} 條規則。",
+            )
+
+    def _handle_new_data(self, container_id: str, stats, power_stats) -> None:
+        super()._handle_new_data(container_id, stats, power_stats)
+        if container_id != self.monitoring_container_id:
+            return
+
+        # Cheap stat-signature checks avoid reparsing JSON on every sample.
+        self.alert_runtime.reload_if_changed()
+        config_error = self.alert_runtime.last_config_error
+        if config_error != self._last_alert_config_error:
+            self._last_alert_config_error = config_error
+            if config_error:
+                self.statusBar().showMessage(
+                    "告警配置無效，已保留上一版本: " + config_error
+                )
+
+        events = self.alert_runtime.evaluate(stats.timestamp, stats, power_stats)
+        self._refresh_alert_action()
+        if not events:
+            return
+
+        event = events[-1]
+        if event.current == AlertStatus.FIRING:
+            self.statusBar().showMessage(
+                f"ALERT [{event.severity}] {event.rule_name}: "
+                f"{event.metric}={event.value:g}"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"RECOVERED {event.rule_name}: {event.metric}={event.value:g}"
+            )
 
     def _show_workload_explorer(self) -> None:
         container_id = self.selected_container_id
