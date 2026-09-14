@@ -51,11 +51,9 @@ class ContainerDiscoveryThread(QThread):
                     break
                 continue
 
-            delivered = False
-
             def deliver(event) -> None:
-                nonlocal delivered
-                delivered = True
+                # One successfully observed event is enough to treat this as a
+                # healthy connection and reset any accumulated retry penalty.
                 backoff.reset()
                 self.container_event.emit(event)
 
@@ -71,13 +69,8 @@ class ContainerDiscoveryThread(QThread):
             else:
                 self.watcher_error.emit("Docker event stream ended; reconnecting")
 
-            # If the stream had delivered events, reset() above makes the next
-            # retry fast. Repeated connect failures still back off.
             delay = backoff.next_delay()
-            if delivered:
-                self.watcher_state.emit(f"reconnecting in {delay:g}s")
-            else:
-                self.watcher_state.emit(f"reconnecting in {delay:g}s")
+            self.watcher_state.emit(f"reconnecting in {delay:g}s")
             if not self._wait_interruptibly(delay):
                 break
 
