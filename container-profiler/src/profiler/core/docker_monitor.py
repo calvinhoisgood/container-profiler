@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Optional
 
+from .discovery import DockerEventWatcher, extract_container_metadata
 from .models import ContainerInfo, ContainerStats
 
 ClientFactory = Callable[[], Any]
@@ -72,7 +73,7 @@ class DockerMonitor:
         return self.is_connected() or self._connect()
 
     def list_containers(self, all: bool = True) -> list[ContainerInfo]:
-        """Return containers visible to the active Docker context."""
+        """Return containers visible to the active Docker context with normalized tags."""
         if not self._ensure_client():
             return []
 
@@ -80,16 +81,29 @@ class DockerMonitor:
             containers = self.client.containers.list(all=all)
             result: list[ContainerInfo] = []
             for container in containers:
-                tags = getattr(getattr(container, "image", None), "tags", None) or []
+                image_tags = getattr(getattr(container, "image", None), "tags", None) or []
                 attrs = getattr(container, "attrs", {}) or {}
-                configured_image = (attrs.get("Config", {}) or {}).get("Image")
+                config = attrs.get("Config", {}) or {}
+                configured_image = config.get("Image")
+                image = str(image_tags[0] if image_tags else configured_image or "unknown")
+                name = str(getattr(container, "name", "unknown"))
+                metadata = extract_container_metadata(
+                    config.get("Labels") or attrs.get("Labels") or {},
+                    container_name=name,
+                    image=image,
+                )
                 result.append(
                     ContainerInfo(
                         id=str(getattr(container, "short_id", None) or container.id),
-                        name=str(getattr(container, "name", "unknown")),
+                        name=name,
                         status=str(getattr(container, "status", "unknown")),
-                        image=str(tags[0] if tags else configured_image or "unknown"),
+                        image=image,
                         created=str(attrs.get("Created", "")),
+                        labels=metadata.labels,
+                        tags=metadata.tags,
+                        env=metadata.env,
+                        service=metadata.service,
+                        version=metadata.version,
                     )
                 )
             self.last_error = None
@@ -97,6 +111,21 @@ class DockerMonitor:
         except Exception as exc:
             self._set_error(exc)
             return []
+
+    def create_event_watcher(self) -> DockerEventWatcher | None:
+        """Create a cancellable local Docker container-event watcher.
+
+        The Docker SDK returns a cancellable stream for ``client.events``. The
+        watcher keeps that blocking detail out of the GUI and normalizes event
+        payloads before consumers see them.
+        """
+        if not self._ensure_client():
+            return None
+
+        def stream_factory():
+            return self.client.events(decode=True, filters={"type": "container"})
+
+        return DockerEventWatcher(stream_factory)
 
     @staticmethod
     def _cpu_percent(stats: dict[str, Any]) -> float:
