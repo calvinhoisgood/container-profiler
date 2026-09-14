@@ -34,6 +34,42 @@ class ContainerEvent:
     attributes: tuple[tuple[str, str], ...] = ()
 
 
+class ReconnectBackoff:
+    """Deterministic bounded exponential backoff for discovery reconnects.
+
+    The policy is intentionally independent from Qt and Docker so reconnect
+    behavior can be tested without a daemon. Call :meth:`reset` after a stream
+    has delivered useful work; otherwise successive failures increase the
+    delay up to ``maximum_s``.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial_s: float = 0.5,
+        maximum_s: float = 30.0,
+        factor: float = 2.0,
+    ) -> None:
+        if initial_s <= 0:
+            raise ValueError("initial_s must be > 0")
+        if maximum_s < initial_s:
+            raise ValueError("maximum_s must be >= initial_s")
+        if factor <= 1:
+            raise ValueError("factor must be > 1")
+        self.initial_s = float(initial_s)
+        self.maximum_s = float(maximum_s)
+        self.factor = float(factor)
+        self._next_s = self.initial_s
+
+    def next_delay(self) -> float:
+        delay = self._next_s
+        self._next_s = min(self.maximum_s, self._next_s * self.factor)
+        return delay
+
+    def reset(self) -> None:
+        self._next_s = self.initial_s
+
+
 def _clean_mapping(raw: Mapping[str, Any] | None) -> dict[str, str]:
     if not raw:
         return {}
