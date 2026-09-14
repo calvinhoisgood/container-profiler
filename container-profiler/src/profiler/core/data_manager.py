@@ -6,7 +6,7 @@ import json
 import math
 import statistics
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -48,6 +48,19 @@ class DataManager:
         self._session_persist_enabled = store is not None
         self.last_storage_error: str | None = None
 
+    @staticmethod
+    def _iso_timestamp(timestamp: float | None = None) -> str:
+        """Return an ISO-8601 UTC timestamp without platform-local time calls.
+
+        Using UTC directly avoids Windows CRT failures for timestamps near the
+        Unix epoch when the local timezone would shift the value before 1970.
+        """
+        if timestamp is None:
+            value = datetime.now(timezone.utc)
+        else:
+            value = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        return value.isoformat(timespec="milliseconds")
+
     def start_recording(self, container_id: str | None = None, target_interval_ms: int | None = None) -> None:
         if target_interval_ms is not None and target_interval_ms <= 0:
             raise ValueError("target_interval_ms must be > 0")
@@ -65,7 +78,7 @@ class DataManager:
                 self.store.start_session(
                     self.session_id,
                     container_id=container_id,
-                    started_at=datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                    started_at=self._iso_timestamp(),
                     target_interval_ms=target_interval_ms,
                 )
             except Exception as exc:
@@ -87,7 +100,7 @@ class DataManager:
         self.is_recording = False
         self._flush_persistence()
         if self._session_persist_enabled and self.store is not None and self.session_id is not None:
-            ended_at = self.recorded_data[-1]["timestamp"] if self.recorded_data else datetime.now().astimezone().isoformat(timespec="milliseconds")
+            ended_at = self.recorded_data[-1]["timestamp"] if self.recorded_data else self._iso_timestamp()
             try:
                 self.store.finish_session(self.session_id, ended_at=ended_at)
             except Exception as exc:
@@ -105,7 +118,7 @@ class DataManager:
             self.start_time = stats.timestamp
         elapsed = max(0.0, stats.timestamp - self.start_time)
         record = {
-            "timestamp": datetime.fromtimestamp(stats.timestamp).astimezone().isoformat(timespec="milliseconds"),
+            "timestamp": self._iso_timestamp(stats.timestamp),
             "elapsed_s": round(elapsed, 6), "container_id": container_id,
             "cpu_percent": stats.cpu_percent, "memory_mb": stats.memory_mb,
             "memory_limit_mb": stats.memory_limit_mb, "memory_percent": stats.memory_percent,
