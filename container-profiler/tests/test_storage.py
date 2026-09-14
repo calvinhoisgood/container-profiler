@@ -48,5 +48,28 @@ class SQLiteTelemetryStoreTests(unittest.TestCase):
                 store.finish_session("missing")
 
 
+class DataManagerPersistenceTests(unittest.TestCase):
+    def test_data_manager_batches_and_finishes_session(self):
+        from profiler.core.data_manager import DataManager
+        from profiler.core.models import ContainerStats, PowerStats
+
+        store = SQLiteTelemetryStore()
+        manager = DataManager(store, persist_batch_size=2)
+        manager.start_recording("abc", 1000)
+        sid = manager.session_id
+        self.assertIsNotNone(sid)
+        for i in range(3):
+            manager.add_record(
+                "abc",
+                ContainerStats(1000+i, 10+i, 100, 200, 50, i, i, None, None, 2),
+                PowerStats(cpu_power_w=20+i),
+            )
+        self.assertEqual(len(store.query_samples(sid)), 2)
+        manager.stop_recording()
+        self.assertEqual(len(store.query_samples(sid)), 3)
+        self.assertIsNotNone(store.get_session(sid)["ended_at"])
+        manager.close()
+
+
 if __name__ == "__main__":
     unittest.main()
