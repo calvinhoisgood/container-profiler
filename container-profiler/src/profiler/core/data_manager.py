@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .models import ContainerStats, PowerStats
+from .storage import SQLiteTelemetryStore
 
 
 class DataManager:
@@ -27,13 +28,25 @@ class DataManager:
         "pids", "cpu_power_w", "gpu_power_w", "gpu_util_percent", "gpu_memory_mb", "gpu_temp_c",
     ]
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        store: SQLiteTelemetryStore | None = None,
+        *,
+        persist_batch_size: int = 100,
+    ) -> None:
+        if persist_batch_size <= 0:
+            raise ValueError("persist_batch_size must be > 0")
         self.recorded_data: list[dict[str, Any]] = []
         self.is_recording = False
         self.start_time: float | None = None
         self.session_id: str | None = None
         self.container_id: str | None = None
         self.target_interval_ms: int | None = None
+        self.store = store
+        self.persist_batch_size = persist_batch_size
+        self._pending_persist: list[dict[str, Any]] = []
+        self._session_persist_enabled = store is not None
+        self.last_storage_error: str | None = None
 
     def start_recording(self, container_id: str | None = None, target_interval_ms: int | None = None) -> None:
         if target_interval_ms is not None and target_interval_ms <= 0:
@@ -44,9 +57,41 @@ class DataManager:
         self.session_id = str(uuid.uuid4())
         self.container_id = container_id
         self.target_interval_ms = target_interval_ms
+        self._pending_persist.clear()
+        self._session_persist_enabled = self.store is not None
+        self.last_storage_error = None
+        if self.store is not None:
+            try:
+                self.store.start_session(
+                    self.session_id,
+                    container_id=container_id,
+                    started_at=datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                    target_interval_ms=target_interval_ms,
+                )
+            except Exception as exc:
+                self._session_persist_enabled = False
+                self.last_storage_error = str(exc)
+
+    def _flush_persistence(self) -> None:
+        if not self._pending_persist or not self._session_persist_enabled or self.store is None or self.session_id is None:
+            return
+        pending = self._pending_persist
+        self._pending_persist = []
+        try:
+            self.store.append_samples(self.session_id, pending)
+        except Exception as exc:
+            self._session_persist_enabled = False
+            self.last_storage_error = str(exc)
 
     def stop_recording(self) -> None:
         self.is_recording = False
+        self._flush_persistence()
+        if self._session_persist_enabled and self.store is not None and self.session_id is not None:
+            ended_at = self.recorded_data[-1]["timestamp"] if self.recorded_data else datetime.now().astimezone().isoformat(timespec="milliseconds")
+            try:
+                self.store.finish_session(self.session_id, ended_at=ended_at)
+            except Exception as exc:
+                self.last_storage_error = str(exc)
 
     def add_record(self, container_id: str, stats: ContainerStats, power_stats: PowerStats) -> None:
         if not self.is_recording:
@@ -59,7 +104,7 @@ class DataManager:
         if self.start_time is None:
             self.start_time = stats.timestamp
         elapsed = max(0.0, stats.timestamp - self.start_time)
-        self.recorded_data.append({
+        record = {
             "timestamp": datetime.fromtimestamp(stats.timestamp).astimezone().isoformat(timespec="milliseconds"),
             "elapsed_s": round(elapsed, 6), "container_id": container_id,
             "cpu_percent": stats.cpu_percent, "memory_mb": stats.memory_mb,
@@ -70,7 +115,12 @@ class DataManager:
             "gpu_power_w": power_stats.gpu_power_w, "gpu_util_percent": power_stats.gpu_util_percent,
             "gpu_memory_mb": power_stats.gpu_memory_mb, "gpu_memory_total_mb": power_stats.gpu_memory_total_mb,
             "gpu_temp_c": power_stats.gpu_temp_c,
-        })
+        }
+        self.recorded_data.append(record)
+        if self._session_persist_enabled:
+            self._pending_persist.append(record)
+            if len(self._pending_persist) >= self.persist_batch_size:
+                self._flush_persistence()
 
     @staticmethod
     def _numeric_values(rows: Iterable[dict[str, Any]], field: str) -> list[float]:
@@ -180,6 +230,12 @@ class DataManager:
             return True
         except (OSError, csv.Error) as exc:
             print(f"導出 CSV 失敗: {exc}"); return False
+
+    def close(self) -> None:
+        if self.is_recording:
+            self.stop_recording()
+        if self.store is not None:
+            self.store.close()
 
     def export_summary_json(self, file_path: str | Path) -> bool:
         if not self.recorded_data:
