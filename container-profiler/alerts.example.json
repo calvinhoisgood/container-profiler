@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "name": "cpu-sustained-high",
+      "metric": "cpu_percent",
+      "operator": "gte",
+      "threshold": 90,
+      "recovery_threshold": 80,
+      "trigger_for_s": 30,
+      "severity": "warning"
+    },
+    {
+      "name": "memory-pressure",
+      "metric": "memory_percent",
+      "operator": "gte",
+      "threshold": 90,
+      "recovery_threshold": 85,
+      "trigger_for_s": 15,
+      "severity": "critical"
+    },
+    {
+      "name": "gpu-hot",
+      "metric": "gpu_temp_c",
+      "operator": "gte",
+      "threshold": 85,
+      "recovery_threshold": 78,
+      "trigger_for_s": 10,
+      "severity": "critical",
+      "enabled": true
+    }
+  ]
+}
