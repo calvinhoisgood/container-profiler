@@ -19,6 +19,6 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run hardware-free core tests
         working-directory: container-profiler
-        run: python -m unittest discover -s tests -p "test_*_unit.py" -v
+        run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: Compile sources
         run: python -m compileall -q container-profiler/src
