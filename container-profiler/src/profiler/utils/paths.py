@@ -39,3 +39,8 @@ def get_telemetry_db_path() -> Path:
     the installation directory.
     """
     return get_config_dir() / "telemetry.sqlite3"
+
+
+def get_alert_config_path() -> Path:
+    """Return the per-user JSON threshold-alert configuration path."""
+    return get_config_dir() / "alerts.json"
