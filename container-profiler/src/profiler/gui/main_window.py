@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -27,6 +27,7 @@ from ..core.storage import SQLiteTelemetryStore
 from ..utils.paths import get_output_dir, get_telemetry_db_path
 from .chart_widget import ChartWidget
 from .container_list import ContainerListWidget
+from .discovery_thread import ContainerDiscoveryThread
 from .metrics_panel import MetricsPanel
 from .session_history import SessionHistoryDialog
 
@@ -103,6 +104,8 @@ class WorkerThread(QThread):
 
 
 class MainWindow(QMainWindow):
+    DISCOVERY_REFRESH_MS = 250
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Container Profiler v5")
@@ -122,7 +125,14 @@ class MainWindow(QMainWindow):
         self.selected_container_id: str | None = None
         self.monitoring_container_id: str | None = None
         self.worker_thread: WorkerThread | None = None
+        self.discovery_thread: ContainerDiscoveryThread | None = None
+        self.discovery_error: str | None = None
         self.last_health_snapshot = None
+
+        self.discovery_refresh_timer = QTimer(self)
+        self.discovery_refresh_timer.setSingleShot(True)
+        self.discovery_refresh_timer.setInterval(self.DISCOVERY_REFRESH_MS)
+        self.discovery_refresh_timer.timeout.connect(self._refresh_container_list)
 
         self._setup_ui()
         self._setup_style()
@@ -134,6 +144,7 @@ class MainWindow(QMainWindow):
         self.export_btn.clicked.connect(self._export_data)
         self.history_btn.clicked.connect(self._show_history)
         self._refresh_container_list()
+        self._start_discovery()
 
     @property
     def is_monitoring(self) -> bool:
@@ -145,6 +156,34 @@ class MainWindow(QMainWindow):
         if not containers:
             detail = self.docker_monitor.last_error or "未發現容器"
             self.statusBar().showMessage(f"Docker: {detail}")
+
+    def _start_discovery(self) -> None:
+        if self.discovery_thread is not None and self.discovery_thread.isRunning():
+            return
+        thread = ContainerDiscoveryThread(self.docker_monitor)
+        thread.container_event.connect(self._handle_container_event)
+        thread.watcher_error.connect(self._handle_discovery_error)
+        thread.watcher_state.connect(self._handle_discovery_state)
+        self.discovery_thread = thread
+        thread.start()
+
+    def _handle_container_event(self, event) -> None:
+        # Coalesce event storms to at most one full Docker list query per
+        # DISCOVERY_REFRESH_MS while guaranteeing progress during a sustained
+        # stream (leading-edge debounce, not indefinitely postponed trailing edge).
+        if not self.discovery_refresh_timer.isActive():
+            self.discovery_refresh_timer.start()
+
+    def _handle_discovery_error(self, error_msg: str) -> None:
+        self.discovery_error = error_msg
+        if not self.is_monitoring:
+            self.statusBar().showMessage(f"容器自動發現重連中: {error_msg}")
+
+    def _handle_discovery_state(self, state: str) -> None:
+        if state == "connected":
+            self.discovery_error = None
+            if not self.is_monitoring:
+                self.statusBar().showMessage("Docker 容器自動發現已連接")
 
     def _on_container_selected(self, container_id: str) -> None:
         self.selected_container_id = container_id
@@ -214,6 +253,8 @@ class MainWindow(QMainWindow):
                 status_message += f" | skipped {self.last_health_snapshot.skipped_ticks}"
             if self.data_manager.last_storage_error:
                 status_message += " | 本機持久化失敗"
+            if self.discovery_error:
+                status_message += " | discovery reconnecting"
         self.statusBar().showMessage(status_message)
 
     def _handle_new_data(self, container_id: str, stats, power_stats) -> None:
@@ -234,10 +275,11 @@ class MainWindow(QMainWindow):
         storage_text = ""
         if self.data_manager.last_storage_error:
             storage_text = " | storage degraded"
+        discovery_text = " | discovery reconnecting" if self.discovery_error else ""
         self.statusBar().showMessage(
             f"監控 {self.monitoring_container_id[:12]} | collect p95 {latency_text} | "
             f"lag p95 {lag_text} | skipped {snapshot.skipped_ticks} | "
-            f"failures {snapshot.failed_cycles}{storage_text}"
+            f"failures {snapshot.failed_cycles}{storage_text}{discovery_text}"
         )
 
     def _handle_monitor_error(self, error_msg: str) -> None:
@@ -361,6 +403,10 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        discovery = self.discovery_thread
+        self.discovery_thread = None
+        if discovery is not None and discovery.isRunning():
+            discovery.stop()
         if self.worker_thread is not None:
             self._stop_monitoring("正在退出")
         self.data_manager.close()
