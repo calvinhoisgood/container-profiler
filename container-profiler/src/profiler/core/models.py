@@ -7,13 +7,18 @@ from typing import Optional
 
 @dataclass(slots=True, frozen=True)
 class ContainerInfo:
-    """A concise snapshot of container identity and lifecycle state."""
+    """A concise snapshot of container identity, lifecycle state, and tags."""
 
     id: str
     name: str
     status: str
     image: str
     created: str
+    labels: tuple[tuple[str, str], ...] = ()
+    tags: tuple[str, ...] = ()
+    env: Optional[str] = None
+    service: Optional[str] = None
+    version: Optional[str] = None
 
 
 @dataclass(slots=True, frozen=True)
