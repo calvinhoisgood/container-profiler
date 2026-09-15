@@ -13,6 +13,7 @@ from .agent_openmetrics import AgentOpenMetricsWorker
 from .agent_self_metrics import normalize_agent_self_metrics
 from .container_metrics import ContainerMetricsWorker
 from .host_monitor import HostRuntimeWorker
+from .metric_alerts import MetricAlertRuntime, MetricAlertTransition
 from .statsd_metrics import StatsDMetricsWorker
 from .storage import SQLiteTelemetryStore
 from .system_metrics import SystemMetricsRuntimeWorker
@@ -57,6 +58,10 @@ class AgentRuntimeSnapshot:
     container_storage_failures: int = 0
     last_container_storage_error: str | None = None
     containers: object | None = None
+    alert_events_persisted: int = 0
+    alert_failures: int = 0
+    last_alert_error: str | None = None
+    metric_alerts: object | None = None
     self_points_persisted: int = 0
     self_storage_failures: int = 0
     last_self_storage_error: str | None = None
@@ -74,6 +79,7 @@ class LocalAgentRuntime:
         openmetrics_worker: AgentOpenMetricsWorker | None = None,
         container_worker: ContainerMetricsWorker | None = None,
         forwarding_worker: AgentForwardingRuntime | None = None,
+        metric_alert_runtime: MetricAlertRuntime | None = None,
         drain_limit: int = 1000,
         retention_s: float = 7 * 24 * 60 * 60,
         retention_max_rows: int = 250_000,
@@ -103,6 +109,7 @@ class LocalAgentRuntime:
         self.openmetrics_worker = openmetrics_worker
         self.container_worker = container_worker
         self.forwarding_worker = forwarding_worker
+        self.metric_alert_runtime = metric_alert_runtime
         self.drain_limit = drain_limit
         self.retention_s = retention_s
         self.retention_max_rows = retention_max_rows
@@ -118,12 +125,14 @@ class LocalAgentRuntime:
         self._statsd_persisted = 0
         self._openmetrics_persisted = 0
         self._container_persisted = 0
+        self._alert_events_persisted = 0
         self._self_persisted = 0
         self._host_storage_failures = 0
         self._system_storage_failures = 0
         self._statsd_storage_failures = 0
         self._openmetrics_storage_failures = 0
         self._container_storage_failures = 0
+        self._alert_failures = 0
         self._self_storage_failures = 0
         self._retention_failures = 0
         self._last_host_storage_error = None
@@ -131,6 +140,7 @@ class LocalAgentRuntime:
         self._last_statsd_storage_error = None
         self._last_openmetrics_storage_error = None
         self._last_container_storage_error = None
+        self._last_alert_error = None
         self._last_self_storage_error = None
         self._last_retention_error = None
         self._next_retention = 0.0
@@ -209,6 +219,38 @@ class LocalAgentRuntime:
             self._container_persisted += written
             self._last_container_storage_error = None
 
+    def _persist_alert_transitions(
+        self, transitions: tuple[MetricAlertTransition, ...]
+    ) -> None:
+        if not transitions:
+            return
+        for transition in transitions:
+            try:
+                self.store.append_alert_event(
+                    transition.event,
+                    container_id=transition.container_id,
+                )
+                self._alert_events_persisted += 1
+                self._last_alert_error = None
+            except Exception as exc:
+                # Metrics have already been committed at this point. Alert audit
+                # persistence is isolated so a damaged alert sink never causes
+                # duplicate telemetry or blocks forwarding.
+                self._alert_failures += 1
+                self._last_alert_error = str(exc)
+
+    def _evaluate_alerts(self, points) -> None:
+        runtime = self.metric_alert_runtime
+        if runtime is None:
+            return
+        try:
+            transitions = runtime.evaluate_points(points)
+        except Exception as exc:
+            self._alert_failures += 1
+            self._last_alert_error = str(exc)
+            return
+        self._persist_alert_transitions(transitions)
+
     def _drain_metrics(self, worker, source: str):
         items = worker.drain_points(self.drain_limit)
         if not items:
@@ -221,6 +263,7 @@ class LocalAgentRuntime:
             return
 
         self._metric_storage_success(source, written)
+        self._evaluate_alerts(items)
         if self.forwarding_worker:
             self.forwarding_worker.enqueue(items)
 
@@ -237,6 +280,7 @@ class LocalAgentRuntime:
             written = self.store.append_custom_metrics(points)
             self._self_persisted += written
             self._last_self_storage_error = None
+            self._evaluate_alerts(points)
             if self.forwarding_worker:
                 self.forwarding_worker.enqueue(points)
         except Exception as exc:
@@ -268,6 +312,12 @@ class LocalAgentRuntime:
     def run_once(self):
         if self.forwarding_worker:
             self.forwarding_worker.tick()
+        if self.metric_alert_runtime:
+            try:
+                self.metric_alert_runtime.reload_if_changed()
+            except Exception as exc:
+                self._alert_failures += 1
+                self._last_alert_error = str(exc)
         self._drain_host()
         self._drain_metrics(self.system_worker, "system")
         if self.statsd_worker:
@@ -339,6 +389,10 @@ class LocalAgentRuntime:
             containers=(
                 None if self.container_worker is None else self.container_worker.snapshot()
             ),
+            alert_events_persisted=self._alert_events_persisted,
+            alert_failures=self._alert_failures,
+            last_alert_error=self._last_alert_error,
+            metric_alerts=_worker_snapshot(self.metric_alert_runtime),
             self_points_persisted=self._self_persisted,
             self_storage_failures=self._self_storage_failures,
             last_self_storage_error=self._last_self_storage_error,
