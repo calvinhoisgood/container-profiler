@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from profiler.core.host_io import (
@@ -5,6 +6,7 @@ from profiler.core.host_io import (
     HostIORateTracker,
     LinuxProcIOBackend,
     NetworkCounters,
+    WindowsNativeIOBackend,
 )
 
 
@@ -46,6 +48,67 @@ ok0: 1 2 0 0 0 0 0 0 3 4 0 0 0 0 0 0
         self.assertEqual(snapshot.timestamp, 12.5)
         self.assertEqual(snapshot.network[0].interface, "eth0")
         self.assertEqual(snapshot.disks[0].device, "sda")
+        self.assertIsNone(snapshot.network_error)
+        self.assertIsNone(snapshot.disk_error)
+
+    def test_source_failure_is_isolated(self):
+        data = {
+            "/proc/net/dev": "eth0: 1 1 0 0 0 0 0 0 2 2 0 0 0 0 0 0\n",
+        }
+        backend = LinuxProcIOBackend(reader=data.__getitem__)
+        snapshot = backend.read()
+        self.assertEqual(len(snapshot.network), 1)
+        self.assertEqual(snapshot.disks, ())
+        self.assertIsNone(snapshot.network_error)
+        self.assertIsNotNone(snapshot.disk_error)
+
+
+class WindowsNativeIOTests(unittest.TestCase):
+    @staticmethod
+    def net(name="Ethernet 2"):
+        return NetworkCounters(name, 100, 200, 10, 20, 1, 2, 3, 4)
+
+    @staticmethod
+    def disk(name="PhysicalDrive0"):
+        return DiskCounters(name, 10, 20, 1000, 2000, 30)
+
+    def test_injected_readers_are_bounded_and_normalized(self):
+        backend = WindowsNativeIOBackend(
+            network_reader=lambda limit: [self.net("Ethernet 2"), self.net("Wi-Fi")],
+            disk_reader=lambda limit: [self.disk(), self.disk("PhysicalDrive1")],
+            wall_clock=lambda: 42.0,
+            max_interfaces=1,
+            max_devices=1,
+        )
+        snapshot = backend.read()
+        self.assertEqual(snapshot.timestamp, 42.0)
+        self.assertEqual([x.interface for x in snapshot.network], ["Ethernet 2"])
+        self.assertEqual([x.device for x in snapshot.disks], ["PhysicalDrive0"])
+        self.assertIsNone(snapshot.network_error)
+        self.assertIsNone(snapshot.disk_error)
+
+    def test_windows_reader_failure_is_isolated(self):
+        def broken(_limit):
+            raise OSError("ip helper unavailable")
+
+        backend = WindowsNativeIOBackend(
+            network_reader=broken,
+            disk_reader=lambda limit: [self.disk()],
+        )
+        snapshot = backend.read()
+        self.assertEqual(snapshot.network, ())
+        self.assertEqual(len(snapshot.disks), 1)
+        self.assertIn("ip helper unavailable", snapshot.network_error)
+        self.assertIsNone(snapshot.disk_error)
+
+    @unittest.skipUnless(os.name == "nt", "native GetIfTable2 smoke only runs on Windows CI")
+    def test_windows_ip_helper_native_smoke(self):
+        # This deliberately only asserts the documented network path. Physical
+        # disk IOCTL availability can depend on runner storage/permissions.
+        backend = WindowsNativeIOBackend(max_interfaces=32, max_devices=1)
+        snapshot = backend.read()
+        self.assertIsNone(snapshot.network_error)
+        self.assertGreater(len(snapshot.network), 0)
 
 
 class RateTrackerTests(unittest.TestCase):
