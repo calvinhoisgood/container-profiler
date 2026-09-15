@@ -9,6 +9,7 @@ from typing import Callable
 
 from .agent_forwarding import AgentForwardingRuntime
 from .agent_openmetrics import AgentOpenMetricsWorker
+from .container_metrics import ContainerMetricsWorker
 from .host_monitor import HostRuntimeWorker
 from .statsd_metrics import StatsDMetricsWorker
 from .storage import SQLiteTelemetryStore
@@ -35,6 +36,10 @@ class AgentRuntimeSnapshot:
     openmetrics_storage_failures: int = 0
     last_openmetrics_storage_error: str | None = None
     openmetrics: object | None = None
+    container_points_persisted: int = 0
+    container_storage_failures: int = 0
+    last_container_storage_error: str | None = None
+    containers: object | None = None
     forwarding: object | None = None
 
 
@@ -47,6 +52,7 @@ class LocalAgentRuntime:
         system_worker: SystemMetricsRuntimeWorker | None = None,
         statsd_worker: StatsDMetricsWorker | None = None,
         openmetrics_worker: AgentOpenMetricsWorker | None = None,
+        container_worker: ContainerMetricsWorker | None = None,
         forwarding_worker: AgentForwardingRuntime | None = None,
         drain_limit: int = 1000,
         retention_s: float = 7 * 24 * 60 * 60,
@@ -68,6 +74,7 @@ class LocalAgentRuntime:
         )
         self.statsd_worker = statsd_worker
         self.openmetrics_worker = openmetrics_worker
+        self.container_worker = container_worker
         self.forwarding_worker = forwarding_worker
         self.drain_limit = drain_limit
         self.retention_s = retention_s
@@ -81,48 +88,48 @@ class LocalAgentRuntime:
         self._system_persisted = 0
         self._statsd_persisted = 0
         self._openmetrics_persisted = 0
+        self._container_persisted = 0
         self._host_storage_failures = 0
         self._system_storage_failures = 0
         self._statsd_storage_failures = 0
         self._openmetrics_storage_failures = 0
+        self._container_storage_failures = 0
         self._retention_failures = 0
         self._last_host_storage_error = None
         self._last_system_storage_error = None
         self._last_statsd_storage_error = None
         self._last_openmetrics_storage_error = None
+        self._last_container_storage_error = None
         self._last_retention_error = None
         self._next_retention = 0.0
 
     def start(self):
         if self._running:
             return
-        forwarding_started = False
-        if self.forwarding_worker:
-            self.forwarding_worker.start()
-            forwarding_started = True
-        self.host_worker.start()
-        system_started = False
-        statsd_started = False
-        openmetrics_started = False
+        started = []
         try:
+            if self.forwarding_worker:
+                self.forwarding_worker.start()
+                started.append((self.forwarding_worker, 6))
+            self.host_worker.start()
+            started.append((self.host_worker, 2))
             self.system_worker.start()
-            system_started = True
+            started.append((self.system_worker, 2))
             if self.statsd_worker:
                 self.statsd_worker.start()
-                statsd_started = True
+                started.append((self.statsd_worker, 2))
             if self.openmetrics_worker:
                 self.openmetrics_worker.start()
-                openmetrics_started = True
+                started.append((self.openmetrics_worker, 2))
+            if self.container_worker:
+                self.container_worker.start()
+                started.append((self.container_worker, 2))
         except Exception:
-            if openmetrics_started and self.openmetrics_worker:
-                self.openmetrics_worker.stop(timeout_s=2)
-            if statsd_started and self.statsd_worker:
-                self.statsd_worker.stop(timeout_s=2)
-            if system_started:
-                self.system_worker.stop(timeout_s=2)
-            self.host_worker.stop(timeout_s=2)
-            if forwarding_started and self.forwarding_worker:
-                self.forwarding_worker.stop(timeout_s=6)
+            for worker, timeout in reversed(started):
+                try:
+                    worker.stop(timeout_s=timeout)
+                except Exception:
+                    pass
             raise
         self._running = True
         self._next_retention = self.monotonic_clock() + self.retention_interval_s
@@ -139,6 +146,34 @@ class LocalAgentRuntime:
             self._host_storage_failures += 1
             self._last_host_storage_error = str(exc)
 
+    def _metric_storage_failure(self, source: str, error: str) -> None:
+        if source == "system":
+            self._system_storage_failures += 1
+            self._last_system_storage_error = error
+        elif source == "statsd":
+            self._statsd_storage_failures += 1
+            self._last_statsd_storage_error = error
+        elif source == "openmetrics":
+            self._openmetrics_storage_failures += 1
+            self._last_openmetrics_storage_error = error
+        elif source == "container":
+            self._container_storage_failures += 1
+            self._last_container_storage_error = error
+
+    def _metric_storage_success(self, source: str, written: int) -> None:
+        if source == "system":
+            self._system_persisted += written
+            self._last_system_storage_error = None
+        elif source == "statsd":
+            self._statsd_persisted += written
+            self._last_statsd_storage_error = None
+        elif source == "openmetrics":
+            self._openmetrics_persisted += written
+            self._last_openmetrics_storage_error = None
+        elif source == "container":
+            self._container_persisted += written
+            self._last_container_storage_error = None
+
     def _drain_metrics(self, worker, source: str):
         items = worker.drain_points(self.drain_limit)
         if not items:
@@ -147,27 +182,10 @@ class LocalAgentRuntime:
             written = self.store.append_custom_metrics(items)
         except Exception as exc:
             worker.requeue_points(items)
-            if source == "system":
-                self._system_storage_failures += 1
-                self._last_system_storage_error = str(exc)
-            elif source == "statsd":
-                self._statsd_storage_failures += 1
-                self._last_statsd_storage_error = str(exc)
-            else:
-                self._openmetrics_storage_failures += 1
-                self._last_openmetrics_storage_error = str(exc)
+            self._metric_storage_failure(source, str(exc))
             return
 
-        if source == "system":
-            self._system_persisted += written
-            self._last_system_storage_error = None
-        elif source == "statsd":
-            self._statsd_persisted += written
-            self._last_statsd_storage_error = None
-        else:
-            self._openmetrics_persisted += written
-            self._last_openmetrics_storage_error = None
-
+        self._metric_storage_success(source, written)
         # Local durability is the source of truth. Remote queue failures are
         # isolated and must never re-ingest already-persisted local points.
         if self.forwarding_worker:
@@ -202,6 +220,8 @@ class LocalAgentRuntime:
             self._drain_metrics(self.statsd_worker, "statsd")
         if self.openmetrics_worker:
             self._drain_metrics(self.openmetrics_worker, "openmetrics")
+        if self.container_worker:
+            self._drain_metrics(self.container_worker, "container")
         self._retention()
         self._ticks += 1
 
@@ -218,27 +238,22 @@ class LocalAgentRuntime:
     def stop(self):
         if not self._running:
             return True
-        host_stopped = self.host_worker.stop(timeout_s=2)
-        system_stopped = self.system_worker.stop(timeout_s=2)
-        statsd_stopped = True
-        openmetrics_stopped = True
+        results = [
+            self.host_worker.stop(timeout_s=2),
+            self.system_worker.stop(timeout_s=2),
+        ]
         if self.statsd_worker:
-            statsd_stopped = self.statsd_worker.stop(timeout_s=2)
+            results.append(self.statsd_worker.stop(timeout_s=2))
         if self.openmetrics_worker:
-            openmetrics_stopped = self.openmetrics_worker.stop(timeout_s=2)
+            results.append(self.openmetrics_worker.stop(timeout_s=2))
+        if self.container_worker:
+            results.append(self.container_worker.stop(timeout_s=2))
         # Stop producers first, then persist/enqueue their final buffered data.
         self.run_once()
-        forwarding_stopped = True
         if self.forwarding_worker:
-            forwarding_stopped = self.forwarding_worker.stop(timeout_s=6)
+            results.append(self.forwarding_worker.stop(timeout_s=6))
         self._running = False
-        return bool(
-            host_stopped
-            and system_stopped
-            and statsd_stopped
-            and openmetrics_stopped
-            and forwarding_stopped
-        )
+        return all(bool(value) for value in results)
 
     def snapshot(self):
         return AgentRuntimeSnapshot(
@@ -261,6 +276,12 @@ class LocalAgentRuntime:
             last_openmetrics_storage_error=self._last_openmetrics_storage_error,
             openmetrics=(
                 None if self.openmetrics_worker is None else self.openmetrics_worker.snapshot()
+            ),
+            container_points_persisted=self._container_persisted,
+            container_storage_failures=self._container_storage_failures,
+            last_container_storage_error=self._last_container_storage_error,
+            containers=(
+                None if self.container_worker is None else self.container_worker.snapshot()
             ),
             forwarding=(
                 None if self.forwarding_worker is None else self.forwarding_worker.snapshot()

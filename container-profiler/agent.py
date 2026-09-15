@@ -17,6 +17,7 @@ from profiler.core.agent_forwarding import AgentForwardingRuntime
 from profiler.core.agent_openmetrics import AgentOpenMetricsWorker
 from profiler.core.agent_runtime import LocalAgentRuntime
 from profiler.core.agent_status import read_agent_status, write_agent_status
+from profiler.core.container_metrics import ContainerMetricsWorker
 from profiler.core.statsd_metrics import StatsDMetricsWorker
 from profiler.core.storage import SQLiteTelemetryStore
 from profiler.utils.paths import (
@@ -35,6 +36,13 @@ def build_parser():
     p.add_argument("--heartbeat-interval", type=float, default=5.0)
     p.add_argument("--status", action="store_true")
     p.add_argument("--status-max-age", type=float, default=15.0)
+    p.add_argument("--container-interval", type=float, default=2.0)
+    p.add_argument("--container-max", type=int, default=256)
+    p.add_argument(
+        "--no-container-metrics",
+        action="store_true",
+        help="Disable headless all-container Docker resource collection",
+    )
     p.add_argument(
         "--dogstatsd-host",
         default="127.0.0.1",
@@ -117,18 +125,26 @@ def _print_status(path, max_age_s):
         f"state={view.state} health={health} pid={view.pid or '-'} age={age} "
         f"ticks={r.get('ticks', '-')} host_samples={r.get('host_samples_persisted', '-')} "
         f"system_points={r.get('system_points_persisted', '-')} "
+        f"container_points={r.get('container_points_persisted', '-')} "
         f"dogstatsd_points={r.get('statsd_points_persisted', '-')} "
         f"openmetrics_points={r.get('openmetrics_points_persisted', '-')}"
     )
     for key in (
         "last_host_storage_error",
         "last_system_storage_error",
+        "last_container_storage_error",
         "last_statsd_storage_error",
         "last_openmetrics_storage_error",
         "last_retention_error",
     ):
         if r.get(key):
             print(f"{key}={r[key]}")
+    containers = r.get("containers")
+    if isinstance(containers, dict):
+        if containers.get("last_docker_error"):
+            print(f"container_docker_error={containers['last_docker_error']}")
+        if containers.get("last_sample_errors"):
+            print("container_sample_errors=" + "; ".join(containers["last_sample_errors"]))
     openmetrics = r.get("openmetrics")
     if isinstance(openmetrics, dict):
         if openmetrics.get("last_docker_error"):
@@ -150,6 +166,12 @@ def _print_status(path, max_age_s):
 
 
 def _runtime_for(store, args):
+    containers = None
+    if not args.no_container_metrics:
+        containers = ContainerMetricsWorker(
+            interval_s=args.container_interval,
+            max_containers=args.container_max,
+        )
     statsd = None
     if not args.no_dogstatsd:
         statsd = StatsDMetricsWorker(
@@ -173,6 +195,7 @@ def _runtime_for(store, args):
         store,
         statsd_worker=statsd,
         openmetrics_worker=openmetrics,
+        container_worker=containers,
         forwarding_worker=forwarding,
     )
 
@@ -188,8 +211,9 @@ def _run_agent(args):
     runtime = None
     snapshot = None
     log.info(
-        "starting headless agent; database=%s dogstatsd=%s openmetrics=%s forwarding=%s",
+        "starting headless agent; database=%s containers=%s dogstatsd=%s openmetrics=%s forwarding=%s",
         database,
+        "disabled" if args.no_container_metrics else f"{args.container_interval:g}s",
         "disabled"
         if args.no_dogstatsd
         else f"{args.dogstatsd_host}:{args.dogstatsd_port}",
@@ -256,10 +280,11 @@ def _run_agent(args):
     if snapshot is not None:
         log.info(
             "agent stopped; ticks=%d host_samples=%d system_points=%d "
-            "dogstatsd_points=%d openmetrics_points=%d",
+            "container_points=%d dogstatsd_points=%d openmetrics_points=%d",
             snapshot.ticks,
             snapshot.host_samples_persisted,
             snapshot.system_points_persisted,
+            snapshot.container_points_persisted,
             snapshot.statsd_points_persisted,
             snapshot.openmetrics_points_persisted,
         )
@@ -273,11 +298,14 @@ def main(argv=None):
         args.poll_interval <= 0
         or args.heartbeat_interval <= 0
         or args.status_max_age <= 0
+        or args.container_interval <= 0
         or args.dogstatsd_flush_interval <= 0
         or args.openmetrics_discovery_interval <= 0
         or args.forwarding_reload_interval <= 0
     ):
         p.error("intervals must be positive")
+    if args.container_max <= 0:
+        p.error("--container-max must be positive")
     if not 0 <= args.dogstatsd_port <= 65535:
         p.error("--dogstatsd-port must be in [0, 65535]")
     logging.basicConfig(
