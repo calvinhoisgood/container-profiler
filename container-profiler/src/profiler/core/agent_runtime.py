@@ -1,6 +1,7 @@
 """Headless local Agent runtime independent from Qt and Docker UI lifecycle."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import socket
@@ -59,6 +60,8 @@ class AgentRuntimeSnapshot:
     last_container_storage_error: str | None = None
     containers: object | None = None
     alert_events_persisted: int = 0
+    alert_events_queued: int = 0
+    alert_events_dropped: int = 0
     alert_failures: int = 0
     last_alert_error: str | None = None
     metric_alerts: object | None = None
@@ -81,6 +84,7 @@ class LocalAgentRuntime:
         forwarding_worker: AgentForwardingRuntime | None = None,
         metric_alert_runtime: MetricAlertRuntime | None = None,
         drain_limit: int = 1000,
+        alert_queue_max: int = 1000,
         retention_s: float = 7 * 24 * 60 * 60,
         retention_max_rows: int = 250_000,
         retention_interval_s: float = 300.0,
@@ -89,8 +93,8 @@ class LocalAgentRuntime:
         wall_clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if drain_limit <= 0:
-            raise ValueError("drain_limit must be positive")
+        if drain_limit <= 0 or alert_queue_max <= 0:
+            raise ValueError("drain_limit and alert_queue_max must be positive")
         if (
             retention_s <= 0
             or retention_interval_s <= 0
@@ -111,6 +115,7 @@ class LocalAgentRuntime:
         self.forwarding_worker = forwarding_worker
         self.metric_alert_runtime = metric_alert_runtime
         self.drain_limit = drain_limit
+        self.alert_queue_max = int(alert_queue_max)
         self.retention_s = retention_s
         self.retention_max_rows = retention_max_rows
         self.retention_interval_s = retention_interval_s
@@ -126,6 +131,8 @@ class LocalAgentRuntime:
         self._openmetrics_persisted = 0
         self._container_persisted = 0
         self._alert_events_persisted = 0
+        self._alert_events_dropped = 0
+        self._pending_alerts: deque[MetricAlertTransition] = deque()
         self._self_persisted = 0
         self._host_storage_failures = 0
         self._system_storage_failures = 0
@@ -219,25 +226,35 @@ class LocalAgentRuntime:
             self._container_persisted += written
             self._last_container_storage_error = None
 
-    def _persist_alert_transitions(
+    def _queue_alert_transitions(
         self, transitions: tuple[MetricAlertTransition, ...]
     ) -> None:
-        if not transitions:
-            return
         for transition in transitions:
+            if len(self._pending_alerts) >= self.alert_queue_max:
+                self._pending_alerts.popleft()
+                self._alert_events_dropped += 1
+            self._pending_alerts.append(transition)
+
+    def _flush_alert_transitions(self) -> None:
+        attempts = 0
+        while self._pending_alerts and attempts < self.drain_limit:
+            transition = self._pending_alerts[0]
+            attempts += 1
             try:
                 self.store.append_alert_event(
                     transition.event,
                     container_id=transition.container_id,
                 )
-                self._alert_events_persisted += 1
-                self._last_alert_error = None
             except Exception as exc:
-                # Metrics have already been committed at this point. Alert audit
-                # persistence is isolated so a damaged alert sink never causes
-                # duplicate telemetry or blocks forwarding.
+                # Keep the oldest failed transition at the front. A broken audit
+                # sink is retried next tick without requeueing already-committed
+                # telemetry or spinning through the rest of the queue.
                 self._alert_failures += 1
                 self._last_alert_error = str(exc)
+                return
+            self._pending_alerts.popleft()
+            self._alert_events_persisted += 1
+            self._last_alert_error = None
 
     def _evaluate_alerts(self, points) -> None:
         runtime = self.metric_alert_runtime
@@ -249,7 +266,7 @@ class LocalAgentRuntime:
             self._alert_failures += 1
             self._last_alert_error = str(exc)
             return
-        self._persist_alert_transitions(transitions)
+        self._queue_alert_transitions(transitions)
 
     def _drain_metrics(self, worker, source: str):
         items = worker.drain_points(self.drain_limit)
@@ -329,6 +346,7 @@ class LocalAgentRuntime:
         self._retention()
         self._ticks += 1
         self._emit_self_metrics()
+        self._flush_alert_transitions()
 
     def run_forever(self, stop_event: threading.Event, *, poll_interval_s: float = 0.5):
         if poll_interval_s <= 0:
@@ -390,6 +408,8 @@ class LocalAgentRuntime:
                 None if self.container_worker is None else self.container_worker.snapshot()
             ),
             alert_events_persisted=self._alert_events_persisted,
+            alert_events_queued=len(self._pending_alerts),
+            alert_events_dropped=self._alert_events_dropped,
             alert_failures=self._alert_failures,
             last_alert_error=self._last_alert_error,
             metric_alerts=_worker_snapshot(self.metric_alert_runtime),
