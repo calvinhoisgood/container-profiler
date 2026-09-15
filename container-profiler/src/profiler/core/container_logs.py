@@ -234,13 +234,7 @@ class ContainerLogWorker:
         return self.monitor
 
     def _remember_timestamped(self, container_id: str, key: tuple[str, str]) -> None:
-        """Remember accepted log identities with bounded multiset semantics.
-
-        A multiset matters here: two legitimate identical writes can share the
-        same timestamp/message. Future overlapping Docker snapshots should drop
-        only as many copies as were observed previously, not collapse duplicates
-        within the current response.
-        """
+        """Remember accepted log identities with bounded multiset semantics."""
         queue = self._recent.setdefault(container_id, deque())
         counts = self._recent_counts.setdefault(container_id, {})
         while len(queue) >= self.dedupe_entries_per_container:
@@ -252,6 +246,30 @@ class ContainerLogWorker:
                 counts.pop(old, None)
         queue.append(key)
         counts[key] = counts.get(key, 0) + 1
+
+    def restore_state(
+        self,
+        cursors: dict[str, float],
+        recent: dict[str, Iterable[tuple[str, str]]] | None = None,
+    ) -> None:
+        """Restore only durable replay state before the worker starts."""
+        with self._condition:
+            if self.is_running():
+                raise RuntimeError("cannot restore log replay state while worker is running")
+            self._cursors = {
+                str(container_id): float(timestamp)
+                for container_id, timestamp in cursors.items()
+                if str(container_id) and float(timestamp) >= 0
+            }
+            self._recent.clear()
+            self._recent_counts.clear()
+            for container_id, identities in (recent or {}).items():
+                key = str(container_id)
+                if key not in self._cursors:
+                    continue
+                values = list(identities)[-self.dedupe_entries_per_container :]
+                for timestamp, message in values:
+                    self._remember_timestamped(key, (str(timestamp), str(message)))
 
     def collect_once(self) -> bool:
         try:
@@ -317,9 +335,6 @@ class ContainerLogWorker:
                 continue
 
             newest = cursor
-            # Snapshot only history from prior polls. Accepted duplicates inside
-            # this response are remembered after the duplicate decision and are
-            # therefore preserved as distinct log writes.
             overlap_counts = dict(self._recent_counts.get(container_id, {}))
             for line in lines:
                 docker_timestamp = getattr(line, "timestamp", None)
@@ -354,8 +369,6 @@ class ContainerLogWorker:
             if newest is not None:
                 self._cursors[container_id] = newest
 
-        # A successful discovery is authoritative: forgotten containers cannot
-        # grow cursor/dedupe state forever. A failed discovery returns earlier.
         for stale in set(self._cursors) - active_ids:
             self._cursors.pop(stale, None)
             self._recent.pop(stale, None)
@@ -379,11 +392,7 @@ class ContainerLogWorker:
             if self.is_running():
                 return
             self._stop_requested = False
-            self._thread = threading.Thread(
-                target=self._run,
-                name="container-log-collector",
-                daemon=True,
-            )
+            self._thread = threading.Thread(target=self._run, name="container-log-collector", daemon=True)
             self._thread.start()
 
     def stop(self, timeout_s: float = 2.0) -> bool:

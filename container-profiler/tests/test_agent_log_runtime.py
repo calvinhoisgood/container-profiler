@@ -33,7 +33,11 @@ class FakeLogs:
         self.records = list(records)
         self.started = False
         self.stopped = False
+        self.dedupe_entries_per_container = 16
+        self.restored = None
 
+    def restore_state(self, cursors, recent=None):
+        self.restored = (dict(cursors), dict(recent or {}))
     def start(self): self.started = True
     def stop(self, timeout_s=2): self.stopped = True; return True
     def drain_records(self, limit):
@@ -59,6 +63,7 @@ class LogAwareAgentRuntimeTests(unittest.TestCase):
                 log_worker=logs,
             )
             runtime.start()
+            self.assertEqual(logs.restored, ({}, {}))
             runtime.run_once()
             snapshot = runtime.snapshot()
             self.assertEqual(snapshot.logs_persisted, 1)
@@ -68,6 +73,26 @@ class LogAwareAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(rows[0]["message"], "hello")
             self.assertTrue(runtime.stop())
             self.assertTrue(logs.stopped)
+
+    def test_runtime_restores_only_durable_log_replay_state(self):
+        with SQLiteTelemetryStore() as store:
+            seed = LogAwareAgentRuntime(
+                store, host_worker=EmptyHost(), system_worker=EmptyMetrics(), log_worker=FakeLogs()
+            )
+            seed.log_repository.append([
+                ContainerLogRecord(
+                    1789466400.0, "abc", "durable", "2026-09-15T10:00:00Z", "web"
+                )
+            ])
+            logs = FakeLogs()
+            runtime = LogAwareAgentRuntime(
+                store, host_worker=EmptyHost(), system_worker=EmptyMetrics(), log_worker=logs
+            )
+            runtime.start()
+            cursors, recent = logs.restored
+            self.assertEqual(cursors["abc"], 1789466400.0)
+            self.assertIn(("2026-09-15T10:00:00Z", "durable"), recent["abc"])
+            self.assertTrue(runtime.stop())
 
     def test_log_worker_is_optional(self):
         with SQLiteTelemetryStore() as store:

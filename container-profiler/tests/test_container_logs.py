@@ -94,6 +94,25 @@ class ContainerLogWorkerTests(unittest.TestCase):
         self.assertEqual(worker.drain_records(10), ())
         self.assertEqual(worker.snapshot().duplicate_records, 2)
 
+    def test_restore_state_deduplicates_restart_overlap_without_hiding_new_lines(self):
+        inspector = FakeInspector({
+            "a": [[
+                ContainerLogLine("2026-09-15T10:00:00Z", "durable"),
+                ContainerLogLine("2026-09-15T10:00:01Z", "new"),
+            ]]
+        })
+        worker = ContainerLogWorker(
+            monitor=FakeMonitor([info("a")]),
+            inspector_factory=lambda client: inspector,
+        )
+        worker.restore_state(
+            {"a": 1789466400.0},
+            {"a": (("2026-09-15T10:00:00Z", "durable"),)},
+        )
+        self.assertTrue(worker.collect_once())
+        self.assertEqual([item.message for item in worker.drain_records(10)], ["new"])
+        self.assertEqual(worker.snapshot().duplicate_records, 1)
+
     def test_failure_isolated_and_container_and_buffer_bounds_visible(self):
         inspector = FakeInspector({
             "a": [[ContainerLogLine("2026-09-15T10:00:00Z", "a")]],

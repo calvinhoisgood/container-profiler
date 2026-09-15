@@ -88,9 +88,28 @@ class LogAwareAgentRuntime(LocalAgentRuntime):
         super().start()
         try:
             if self.log_worker is not None:
+                if self.log_repository is not None:
+                    try:
+                        max_replay = int(
+                            getattr(self.log_worker, "dedupe_entries_per_container", 4096)
+                        )
+                        cursors, recent = self.log_repository.replay_state(
+                            max_entries_per_container=max_replay
+                        )
+                        restore = getattr(self.log_worker, "restore_state", None)
+                        if callable(restore):
+                            restore(cursors, recent)
+                    except Exception as exc:
+                        self._log_storage_failures += 1
+                        self._last_log_storage_error = f"replay state: {exc}"
                 self.log_worker.start()
                 self._next_log_retention = self.monotonic_clock() + self.log_retention_interval_s
         except Exception:
+            if self.log_worker is not None:
+                try:
+                    self.log_worker.stop(timeout_s=2)
+                except Exception:
+                    pass
             super().stop()
             raise
 
