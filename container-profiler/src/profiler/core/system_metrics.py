@@ -16,6 +16,7 @@ from typing import Callable, Iterable
 from .custom_metrics import BoundedMetricBuffer, CustomMetricPoint, MetricBufferStats
 from .host_filesystem import FilesystemStats, NativeFilesystemMonitor
 from .host_io import HostIORateTracker, HostIOSnapshot, IORate, create_native_io_backend
+from .host_monitor import HostStats
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,82 @@ class SystemMetricsWorkerSnapshot:
 
 def _tags(hostname: str, device: str) -> tuple[str, str]:
     return (f"host:{hostname}", f"device:{device}")
+
+
+def normalize_host_stats_metrics(
+    samples: Iterable[HostStats],
+    *,
+    hostname: str,
+) -> tuple[CustomMetricPoint, ...]:
+    """Map native CPU/memory/load/uptime samples to safe System check metrics.
+
+    Only metrics that can be represented faithfully by the current normalized
+    HostStats contract are emitted. In particular ``system.mem.used`` is not
+    synthesized from MemAvailable on Linux because Datadog's documented Linux
+    definition uses a different free/cached breakdown.
+    """
+    host = hostname.strip() or "unknown"
+    host_tags = (f"host:{host}",)
+    points: list[CustomMetricPoint] = []
+    for sample in samples:
+        timestamp = float(sample.timestamp)
+        common = {
+            "timestamp": timestamp,
+            "tags": host_tags,
+            "metric_type": "gauge",
+            "source": "system",
+            "target_key": "host-core",
+        }
+        if sample.cpu_percent is not None:
+            points.append(CustomMetricPoint(
+                name="system.cpu.idle",
+                value=max(0.0, min(100.0, 100.0 - float(sample.cpu_percent))),
+                unit="percent",
+                **common,
+            ))
+        points.append(CustomMetricPoint(
+            name="system.cpu.num_cores",
+            value=float(sample.logical_cpus),
+            unit="core",
+            **common,
+        ))
+        total_bytes = float(sample.memory_total_mb) * 1024.0 * 1024.0
+        usable_bytes = float(sample.memory_available_mb) * 1024.0 * 1024.0
+        usable_fraction = usable_bytes / total_bytes if total_bytes > 0 else 0.0
+        for name, value, unit in (
+            ("system.mem.total", total_bytes, "byte"),
+            ("system.mem.usable", usable_bytes, "byte"),
+            ("system.mem.pct_usable", usable_fraction, "fraction"),
+            ("system.uptime", max(0.0, float(sample.uptime_s)), "second"),
+        ):
+            points.append(CustomMetricPoint(
+                name=name,
+                value=value,
+                unit=unit,
+                **common,
+            ))
+        loads = (
+            ("system.load.1", "system.load.norm.1", sample.load_1),
+            ("system.load.5", "system.load.norm.5", sample.load_5),
+            ("system.load.15", "system.load.norm.15", sample.load_15),
+        )
+        cpus = max(1, int(sample.logical_cpus))
+        for raw_name, normalized_name, value in loads:
+            if value is None:
+                continue
+            points.append(CustomMetricPoint(
+                name=raw_name,
+                value=float(value),
+                unit=None,
+                **common,
+            ))
+            points.append(CustomMetricPoint(
+                name=normalized_name,
+                value=float(value) / cpus,
+                unit=None,
+                **common,
+            ))
+    return tuple(points)
 
 
 def normalize_host_io_metrics(
