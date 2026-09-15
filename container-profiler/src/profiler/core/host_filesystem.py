@@ -29,7 +29,6 @@ class FilesystemStats:
 
 
 def _decode_mount_field(value: str) -> str:
-    # proc mount fields escape whitespace/backslash as octal sequences.
     return (
         value.replace("\\040", " ")
         .replace("\\011", "\t")
@@ -38,20 +37,28 @@ def _decode_mount_field(value: str) -> str:
     )
 
 
+def _native_statvfs(path: str) -> Any:
+    """Resolve statvfs lazily so this module remains import-safe on Windows."""
+    func = getattr(os, "statvfs", None)
+    if func is None:
+        raise OSError("statvfs is unavailable on this platform")
+    return func(path)
+
+
 class LinuxFilesystemBackend:
     """Read mounted local filesystems using /proc/self/mounts + statvfs."""
 
     DEFAULT_IGNORED_TYPES = frozenset({
         "autofs", "binfmt_misc", "cgroup", "cgroup2", "configfs", "debugfs",
         "devpts", "devtmpfs", "fusectl", "hugetlbfs", "mqueue", "proc",
-        "pstore", "securityfs", "sysfs", "tracefs",
+        "pstore", "ramfs", "securityfs", "sysfs", "tmpfs", "tracefs",
     })
 
     def __init__(
         self,
         *,
         mounts_reader: Callable[[], str] | None = None,
-        statvfs: Callable[[str], Any] = os.statvfs,
+        statvfs: Callable[[str], Any] = _native_statvfs,
         wall_clock: Callable[[], float] = time.time,
         ignored_types: Iterable[str] | None = None,
         max_filesystems: int = 256,
@@ -84,7 +91,6 @@ class LinuxFilesystemBackend:
                 continue
             block_size = int(info.f_frsize or info.f_bsize)
             total = max(0, int(info.f_blocks) * block_size)
-            # bavail is the space usable by an unprivileged Agent process.
             free = min(total, max(0, int(info.f_bavail) * block_size))
             used = max(0, total - free)
             percent = used / total * 100.0 if total else 0.0
@@ -146,7 +152,6 @@ class WindowsFilesystemBackend:
             if not self.kernel32.GetDiskFreeSpaceExW(
                 root, ctypes.byref(available), ctypes.byref(total), ctypes.byref(free_total)
             ):
-                # Removable/offline drives must not break the whole host check.
                 continue
             total_value = int(total.value)
             free_value = min(total_value, int(available.value))
