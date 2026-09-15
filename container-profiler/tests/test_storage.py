@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from profiler.core.alerting import AlertEvent, AlertStatus
+from profiler.core.custom_metrics import CustomMetricPoint
 from profiler.core.storage import SQLiteTelemetryStore
 
 
@@ -94,6 +95,81 @@ class SQLiteTelemetryStoreTests(unittest.TestCase):
             self.assertEqual(rows[0]["id"], event_id)
             self.assertIsNone(rows[0]["session_id"])
             self.assertEqual(rows[0]["container_id"], "abc")
+
+    def test_custom_metric_round_trip_filters_and_prefix_escaping(self):
+        with SQLiteTelemetryStore() as store:
+            points = (
+                CustomMetricPoint(
+                    10.0, "demo.requests_total", 12.0,
+                    tags=("service:web", "status:200"), metric_type="counter",
+                    unit="request", target_key="abc:openmetrics:0", container_id="abc",
+                ),
+                CustomMetricPoint(
+                    11.0, "demo.requests_total", 14.0,
+                    tags=("service:web", "status:500"), metric_type="counter",
+                    target_key="abc:openmetrics:0", container_id="abc",
+                ),
+                CustomMetricPoint(
+                    12.0, "demo.cpu_temp", 70.0,
+                    tags=("sensor:cpu",), metric_type="gauge",
+                    unit="celsius", target_key="def:openmetrics:0", container_id="def",
+                ),
+                CustomMetricPoint(13.0, "literal%metric", 1.0, container_id="abc"),
+                CustomMetricPoint(14.0, "literal_metric", 2.0, container_id="abc"),
+            )
+            self.assertEqual(store.append_custom_metrics(points), 5)
+
+            rows = store.query_custom_metrics(name="demo.requests_total")
+            self.assertEqual([row["value"] for row in rows], [14.0, 12.0])
+            self.assertEqual(rows[0]["tags"], ("service:web", "status:500"))
+            self.assertEqual(
+                store.query_custom_metrics(container_id="def")[0]["unit"], "celsius"
+            )
+            self.assertEqual(
+                store.query_custom_metrics(target_key="abc:openmetrics:0", limit=1)[0]["timestamp"],
+                11.0,
+            )
+            self.assertEqual(
+                [row["name"] for row in store.query_custom_metrics(name_prefix="literal%")],
+                ["literal%metric"],
+            )
+            self.assertEqual(
+                [row["name"] for row in store.query_custom_metrics(name_prefix="literal_")],
+                ["literal_metric"],
+            )
+            self.assertEqual(store.list_custom_metric_names(prefix="demo."), [
+                "demo.cpu_temp", "demo.requests_total"
+            ])
+
+    def test_custom_metric_retention_by_age_then_row_count(self):
+        with SQLiteTelemetryStore() as store:
+            store.append_custom_metrics(
+                CustomMetricPoint(float(i), "metric", float(i), container_id="abc")
+                for i in range(10)
+            )
+            self.assertEqual(store.prune_custom_metrics(before_timestamp=3.0), 3)
+            self.assertEqual(len(store.query_custom_metrics(limit=100)), 7)
+            self.assertEqual(store.prune_custom_metrics(max_rows=4), 3)
+            remaining = store.query_custom_metrics(limit=100)
+            self.assertEqual([row["timestamp"] for row in remaining], [9.0, 8.0, 7.0, 6.0])
+            self.assertEqual(store.prune_custom_metrics(max_rows=4), 0)
+            with self.assertRaises(ValueError):
+                store.prune_custom_metrics(max_rows=-1)
+
+    def test_schema_v2_database_migrates_to_custom_metrics(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "old.db"
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("INSERT INTO schema_meta(key,value) VALUES('schema_version','2')")
+            db.commit()
+            db.close()
+
+            with SQLiteTelemetryStore(path) as store:
+                store.append_custom_metrics((CustomMetricPoint(1.0, "m", 2.0),))
+                self.assertEqual(store.query_custom_metrics()[0]["name"], "m")
 
 
 class DataManagerPersistenceTests(unittest.TestCase):
