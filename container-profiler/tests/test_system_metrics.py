@@ -1,5 +1,6 @@
 import unittest
 
+from profiler.core.host_filesystem import FilesystemStats
 from profiler.core.host_io import DiskCounters, HostIOSnapshot, NetworkCounters
 from profiler.core.system_metrics import NativeSystemMetricsCollector, SystemMetricsRuntimeWorker
 
@@ -12,6 +13,17 @@ class SequenceBackend:
         if not self.snapshots:
             raise OSError("no more snapshots")
         return self.snapshots.pop(0)
+
+
+class FakeFilesystemMonitor:
+    def __init__(self, stats=(), *, error=None):
+        self.stats = tuple(stats)
+        self.last_error = error
+        self.calls = 0
+
+    def get_stats(self):
+        self.calls += 1
+        return self.stats
 
 
 def net(rx, tx, *, packets_in=10, packets_out=20, errors_in=1, errors_out=2, drops_in=3, drops_out=4):
@@ -30,6 +42,19 @@ def net(rx, tx, *, packets_in=10, packets_out=20, errors_in=1, errors_out=2, dro
 
 def disk(read_bytes, write_bytes, *, reads=10, writes=20):
     return DiskCounters("PhysicalDrive0", reads, writes, read_bytes, write_bytes, 0)
+
+
+def filesystem():
+    return FilesystemStats(
+        timestamp=5.0,
+        mountpoint="C:\\",
+        device="C:\\",
+        filesystem="ntfs",
+        total_bytes=1000,
+        used_bytes=250,
+        free_bytes=750,
+        used_percent=25.0,
+    )
 
 
 class NativeSystemMetricsTests(unittest.TestCase):
@@ -87,6 +112,51 @@ class NativeSystemMetricsTests(unittest.TestCase):
         self.assertEqual(values["system.net.bytes_rcvd"], 100.0)
         self.assertEqual(values["system.net.bytes_sent"], 200.0)
 
+    def test_filesystem_metrics_use_disk_namespace_and_fraction_semantics(self):
+        monitor = FakeFilesystemMonitor([filesystem()])
+        backend = SequenceBackend([HostIOSnapshot(5.0, (), ())])
+        collector = NativeSystemMetricsCollector(
+            backend,
+            filesystem_monitor=monitor,
+            hostname=lambda: "host-a",
+            monotonic_clock=lambda: 0.0,
+        )
+        points = collector.collect()
+        values = {point.name: point.value for point in points}
+        self.assertEqual(values["system.disk.total"], 1000.0)
+        self.assertEqual(values["system.disk.free"], 750.0)
+        self.assertEqual(values["system.disk.used"], 250.0)
+        self.assertEqual(values["system.disk.in_use"], 0.25)
+        self.assertEqual(values["system.disk.utilized"], 25.0)
+        point = next(p for p in points if p.name == "system.disk.total")
+        self.assertIn("device:C:\\", point.tags)
+        self.assertIn("mountpoint:C:\\", point.tags)
+        self.assertIn("filesystem:ntfs", point.tags)
+
+    def test_filesystem_check_has_independent_cadence_without_catchup(self):
+        now = [0.0]
+        monitor = FakeFilesystemMonitor([filesystem()])
+        backend = SequenceBackend([
+            HostIOSnapshot(1.0, (), ()),
+            HostIOSnapshot(2.0, (), ()),
+            HostIOSnapshot(3.0, (), ()),
+        ])
+        collector = NativeSystemMetricsCollector(
+            backend,
+            filesystem_monitor=monitor,
+            filesystem_interval_s=15.0,
+            monotonic_clock=lambda: now[0],
+        )
+        first = collector.collect()
+        self.assertIn("system.disk.total", {p.name for p in first})
+        now[0] = 14.9
+        second = collector.collect()
+        self.assertNotIn("system.disk.total", {p.name for p in second})
+        now[0] = 30.0
+        third = collector.collect()
+        self.assertIn("system.disk.total", {p.name for p in third})
+        self.assertEqual(monitor.calls, 2)
+
     def test_partial_backend_failure_keeps_healthy_side_and_health_state(self):
         backend = SequenceBackend([
             HostIOSnapshot(
@@ -106,6 +176,21 @@ class NativeSystemMetricsTests(unittest.TestCase):
         self.assertEqual(snapshot.partial_collections, 1)
         self.assertEqual(snapshot.disk_error, "disk access denied")
         self.assertIsNone(snapshot.network_error)
+
+    def test_filesystem_failure_is_visible_but_does_not_drop_network_metrics(self):
+        monitor = FakeFilesystemMonitor((), error="volume query failed")
+        backend = SequenceBackend([HostIOSnapshot(1.0, (net(1, 2),), ())])
+        collector = NativeSystemMetricsCollector(
+            backend,
+            filesystem_monitor=monitor,
+            monotonic_clock=lambda: 0.0,
+        )
+        worker = SystemMetricsRuntimeWorker(collector, max_points=100, max_bytes=100_000)
+        self.assertGreater(worker.collect_once(), 0)
+        snapshot = worker.snapshot()
+        self.assertEqual(snapshot.partial_collections, 1)
+        self.assertEqual(snapshot.filesystem_error, "volume query failed")
+        self.assertEqual(snapshot.failed_collections, 0)
 
     def test_total_collection_failure_does_not_destroy_buffered_points(self):
         backend = SequenceBackend([
