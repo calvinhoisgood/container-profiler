@@ -1,8 +1,8 @@
-"""Normalize native host I/O into Datadog-compatible system metric names.
+"""Normalize native host checks into Datadog-compatible system metric names.
 
-The native collectors own platform-specific counter acquisition. This module
-owns metric semantics, tags, buffering and scheduling so Windows and Linux emit
-the same contract. Rate metrics are deliberately omitted on first observation,
+Platform collectors own OS-specific acquisition. This module owns metric
+semantics, tags, independent check cadence, buffering and scheduling so Windows
+and Linux emit the same contract. Rate metrics are omitted on first observation,
 a counter reset, or an excessive sampling gap rather than inventing a zero.
 """
 from __future__ import annotations
@@ -14,12 +14,8 @@ import time
 from typing import Callable, Iterable
 
 from .custom_metrics import BoundedMetricBuffer, CustomMetricPoint, MetricBufferStats
-from .host_io import (
-    HostIORateTracker,
-    HostIOSnapshot,
-    IORate,
-    create_native_io_backend,
-)
+from .host_filesystem import FilesystemStats, NativeFilesystemMonitor
+from .host_io import HostIORateTracker, HostIOSnapshot, IORate, create_native_io_backend
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +34,7 @@ class SystemMetricsWorkerSnapshot:
     last_error: str | None
     network_error: str | None
     disk_error: str | None
+    filesystem_error: str | None
     buffer: MetricBufferStats
 
 
@@ -50,13 +47,7 @@ def normalize_host_io_metrics(
     *,
     hostname: str,
 ) -> tuple[CustomMetricPoint, ...]:
-    """Convert raw host I/O plus derived rates into the shared metric model.
-
-    Names intentionally follow Datadog's documented system/network check
-    namespaces so the local Explorer and optional forwarder can use the same
-    vocabulary. Raw packet/error/drop counters are gauges. Throughput and IOPS
-    are already interval-derived gauges.
-    """
+    """Convert raw host I/O plus derived rates into shared system metrics."""
     hostname = hostname.strip() or "unknown"
     timestamp = float(collection.snapshot.timestamp)
     network_rates = {rate.name: rate for rate in collection.network_rates}
@@ -143,21 +134,66 @@ def normalize_host_io_metrics(
     return tuple(points)
 
 
+def normalize_filesystem_metrics(
+    stats: Iterable[FilesystemStats],
+    *,
+    hostname: str,
+) -> tuple[CustomMetricPoint, ...]:
+    """Normalize filesystem capacity using Datadog's documented disk names."""
+    hostname = hostname.strip() or "unknown"
+    points: list[CustomMetricPoint] = []
+    for item in stats:
+        device = item.device or item.mountpoint
+        tag_values = list(_tags(hostname, device))
+        tag_values.append(f"mountpoint:{item.mountpoint}")
+        if item.filesystem:
+            tag_values.append(f"filesystem:{item.filesystem}")
+        tags = tuple(tag_values)
+        for name, value, unit in (
+            ("system.disk.total", float(item.total_bytes), "byte"),
+            ("system.disk.free", float(item.free_bytes), "byte"),
+            ("system.disk.used", float(item.used_bytes), "byte"),
+            ("system.disk.in_use", float(item.used_percent) / 100.0, "fraction"),
+            ("system.disk.utilized", float(item.used_percent), "percent"),
+        ):
+            points.append(CustomMetricPoint(
+                timestamp=float(item.timestamp),
+                name=name,
+                value=value,
+                tags=tags,
+                metric_type="gauge",
+                unit=unit,
+                source="system",
+                target_key="host-filesystem",
+            ))
+    return tuple(points)
+
+
 class NativeSystemMetricsCollector:
-    """Platform-neutral facade over native I/O counters and rate derivation."""
+    """Platform-neutral facade over native network, I/O and filesystem checks."""
 
     def __init__(
         self,
         backend=None,
         *,
         tracker: HostIORateTracker | None = None,
+        filesystem_monitor: NativeFilesystemMonitor | None = None,
+        filesystem_interval_s: float = 15.0,
         hostname: Callable[[], str] = socket.gethostname,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if filesystem_interval_s <= 0:
+            raise ValueError("filesystem_interval_s must be positive")
         self.backend = backend or create_native_io_backend()
         self.tracker = tracker or HostIORateTracker()
+        self.filesystem_monitor = filesystem_monitor
+        self.filesystem_interval_s = float(filesystem_interval_s)
         self.hostname = hostname
+        self.monotonic_clock = monotonic_clock
+        self._next_filesystem_due = 0.0
         self.last_network_error: str | None = None
         self.last_disk_error: str | None = None
+        self.last_filesystem_error: str | None = None
 
     def collect(self) -> tuple[CustomMetricPoint, ...]:
         snapshot = self.backend.read()
@@ -168,14 +204,23 @@ class NativeSystemMetricsCollector:
             network_rates=self.tracker.update_network(snapshot.timestamp, snapshot.network),
             disk_rates=self.tracker.update_disks(snapshot.timestamp, snapshot.disks),
         )
-        return normalize_host_io_metrics(
-            collection,
-            hostname=str(self.hostname() or "unknown"),
-        )
+        host = str(self.hostname() or "unknown")
+        points = list(normalize_host_io_metrics(collection, hostname=host))
+
+        monitor = self.filesystem_monitor
+        now = float(self.monotonic_clock())
+        if monitor is not None and now >= self._next_filesystem_due:
+            filesystem_stats = monitor.get_stats()
+            self.last_filesystem_error = monitor.last_error
+            points.extend(normalize_filesystem_metrics(filesystem_stats, hostname=host))
+            # Schedule from completion/current time, never catch up after sleep.
+            self._next_filesystem_due = now + self.filesystem_interval_s
+
+        return tuple(points)
 
 
 class SystemMetricsRuntimeWorker:
-    """Continuously collect system I/O into a bounded shared metric buffer."""
+    """Continuously collect native system checks into a bounded metric buffer."""
 
     def __init__(
         self,
@@ -188,7 +233,9 @@ class SystemMetricsRuntimeWorker:
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
-        self.collector = collector or NativeSystemMetricsCollector()
+        self.collector = collector or NativeSystemMetricsCollector(
+            filesystem_monitor=NativeFilesystemMonitor()
+        )
         self.interval_s = float(interval_s)
         self.monotonic_clock = monotonic_clock
         self.buffer = BoundedMetricBuffer(max_points=max_points, max_bytes=max_bytes)
@@ -230,7 +277,11 @@ class SystemMetricsRuntimeWorker:
         with self._condition:
             self._collections += 1
             self._last_error = None
-            if self.collector.last_network_error or self.collector.last_disk_error:
+            if (
+                self.collector.last_network_error
+                or self.collector.last_disk_error
+                or self.collector.last_filesystem_error
+            ):
                 self._partial_collections += 1
         return accepted
 
@@ -250,6 +301,7 @@ class SystemMetricsRuntimeWorker:
                 last_error=self._last_error,
                 network_error=self.collector.last_network_error,
                 disk_error=self.collector.last_disk_error,
+                filesystem_error=self.collector.last_filesystem_error,
                 buffer=self.buffer.stats(),
             )
 
