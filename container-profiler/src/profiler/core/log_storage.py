@@ -100,12 +100,20 @@ class ContainerLogRepository:
         contains: str | None = None,
         start_timestamp: float | None = None,
         end_timestamp: float | None = None,
+        before_timestamp: float | None = None,
         before_id: int | None = None,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        """Return newest-first bounded log rows with literal substring search."""
+        """Return newest-first bounded log rows with literal substring search.
+
+        Pagination uses the same ``(timestamp DESC, id DESC)`` ordering as the
+        query. Callers must supply both cursor components so out-of-order Docker
+        timestamps cannot create gaps or duplicates between pages.
+        """
         if limit <= 0:
             return []
+        if (before_timestamp is None) != (before_id is None):
+            raise ValueError("before_timestamp and before_id must be provided together")
         clauses: list[str] = []
         params: list[Any] = []
         if container_id is not None:
@@ -123,9 +131,10 @@ class ContainerLogRepository:
         if end_timestamp is not None:
             clauses.append("timestamp<=?")
             params.append(float(end_timestamp))
-        if before_id is not None:
-            clauses.append("id<?")
-            params.append(int(before_id))
+        if before_timestamp is not None and before_id is not None:
+            clauses.append("(timestamp<? OR (timestamp=? AND id<?))")
+            cursor_timestamp = float(before_timestamp)
+            params.extend((cursor_timestamp, cursor_timestamp, int(before_id)))
         where = "" if not clauses else "WHERE " + " AND ".join(clauses)
         params.append(min(int(limit), 5000))
         rows = self._db.execute(
