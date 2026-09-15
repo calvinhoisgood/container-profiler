@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from profiler.core.host_process import (
     LinuxProcProcessBackend,
@@ -33,7 +34,7 @@ class LinuxProcessBackendTests(unittest.TestCase):
         }
 
         def reader(path):
-            pid = str(path).split("/")[-2]
+            pid = Path(path).parent.name
             if pid == "8":
                 raise FileNotFoundError(pid)
             return payloads[pid]
@@ -61,7 +62,7 @@ class LinuxProcessBackendTests(unittest.TestCase):
             proc_root="/fake",
             listdir=lambda root: ["1", "2"],
             reader=lambda path: (
-                "bad" if str(path).endswith("1/stat") else stat_line(2, "ok", "S", 2)
+                "bad" if Path(path).parent.name == "1" else stat_line(2, "ok", "S", 2)
             ),
         )
         stats = backend.read()
