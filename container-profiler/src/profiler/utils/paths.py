@@ -36,6 +36,11 @@ def get_telemetry_db_path() -> Path:
     return get_config_dir() / "telemetry.sqlite3"
 
 
+def get_agent_status_path() -> Path:
+    """Return the atomic headless-agent heartbeat/status path."""
+    return get_config_dir() / "agent-status.json"
+
+
 def get_alert_config_path() -> Path:
     """Return the per-user JSON threshold-alert configuration path."""
     return get_config_dir() / "alerts.json"
