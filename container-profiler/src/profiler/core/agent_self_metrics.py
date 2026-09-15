@@ -56,6 +56,7 @@ def normalize_agent_self_metrics(
         ("container_points_persisted", "container"),
         ("statsd_points_persisted", "dogstatsd"),
         ("openmetrics_points_persisted", "openmetrics"),
+        ("alert_events_persisted", "alerts"),
     ):
         add(
             "container_profiler.agent.persisted",
@@ -68,6 +69,7 @@ def normalize_agent_self_metrics(
         ("container_storage_failures", "container"),
         ("statsd_storage_failures", "dogstatsd"),
         ("openmetrics_storage_failures", "openmetrics"),
+        ("self_storage_failures", "self"),
         ("retention_failures", "retention"),
     ):
         add(
@@ -75,6 +77,10 @@ def normalize_agent_self_metrics(
             _get(snapshot, field, default=0),
             f"subsystem:{subsystem}",
         )
+    add(
+        "container_profiler.alert.failures",
+        _get(snapshot, "alert_failures", default=0),
+    )
 
     host_runtime = _get(snapshot, "host")
     if host_runtime is not None:
@@ -151,6 +157,21 @@ def normalize_agent_self_metrics(
         "container_profiler.container.buffer_dropped_points",
         _get(containers, "buffer", "dropped_points"),
     )
+
+    metric_alerts = _get(snapshot, "metric_alerts")
+    for field, metric in (
+        ("rule_count", "container_profiler.alert.rules"),
+        ("tracked_series", "container_profiler.alert.tracked_series"),
+        ("event_count", "container_profiler.alert.recent_events"),
+        ("evicted_series", "container_profiler.alert.evicted_series"),
+        ("invalid_points", "container_profiler.alert.invalid_points"),
+    ):
+        add(metric, _get(metric_alerts, field))
+    if metric_alerts is not None:
+        add(
+            "container_profiler.alert.config_error",
+            1 if _get(metric_alerts, "last_config_error") else 0,
+        )
 
     forwarding = _get(snapshot, "forwarding")
     add(
