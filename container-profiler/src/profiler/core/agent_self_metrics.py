@@ -54,6 +54,7 @@ def normalize_agent_self_metrics(
         ("host_samples_persisted", "host"),
         ("system_points_persisted", "system"),
         ("container_points_persisted", "container"),
+        ("logs_persisted", "logs"),
         ("statsd_points_persisted", "dogstatsd"),
         ("openmetrics_points_persisted", "openmetrics"),
         ("alert_events_persisted", "alerts"),
@@ -67,6 +68,7 @@ def normalize_agent_self_metrics(
         ("host_storage_failures", "host"),
         ("system_storage_failures", "system"),
         ("container_storage_failures", "container"),
+        ("log_storage_failures", "logs"),
         ("statsd_storage_failures", "dogstatsd"),
         ("openmetrics_storage_failures", "openmetrics"),
         ("self_storage_failures", "self"),
@@ -164,6 +166,24 @@ def normalize_agent_self_metrics(
     add(
         "container_profiler.container.buffer_dropped_points",
         _get(containers, "buffer", "dropped_points"),
+    )
+
+    logs = _get(snapshot, "logs")
+    add(
+        "container_profiler.logs.discovery_failures",
+        _get(logs, "discovery_failures"),
+    )
+    add("container_profiler.logs.sample_failures", _get(logs, "sample_failures"))
+    add("container_profiler.logs.records_collected", _get(logs, "records_collected"))
+    add("container_profiler.logs.duplicate_records", _get(logs, "duplicate_records"))
+    add("container_profiler.logs.untimestamped_records", _get(logs, "untimestamped_records"))
+    add(
+        "container_profiler.logs.buffer_queued_records",
+        _get(logs, "buffer", "queued_records"),
+    )
+    add(
+        "container_profiler.logs.buffer_dropped_records",
+        _get(logs, "buffer", "dropped_records"),
     )
 
     metric_alerts = _get(snapshot, "metric_alerts")

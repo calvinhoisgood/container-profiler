@@ -14,9 +14,10 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from profiler.core.agent_forwarding import AgentForwardingRuntime
+from profiler.core.agent_log_runtime import LogAwareAgentRuntime
 from profiler.core.agent_openmetrics import AgentOpenMetricsWorker
-from profiler.core.agent_runtime import LocalAgentRuntime
 from profiler.core.agent_status import read_agent_status, write_agent_status
+from profiler.core.container_logs import ContainerLogWorker
 from profiler.core.container_metrics import ContainerMetricsWorker
 from profiler.core.metric_alerts import MetricAlertRuntime
 from profiler.core.statsd_metrics import StatsDMetricsWorker
@@ -45,6 +46,15 @@ def build_parser():
         action="store_true",
         help="Disable headless all-container Docker resource collection",
     )
+    p.add_argument(
+        "--container-logs",
+        action="store_true",
+        help="Opt in to bounded Docker container log collection and local persistence",
+    )
+    p.add_argument("--container-log-interval", type=float, default=5.0)
+    p.add_argument("--container-log-max-containers", type=int, default=32)
+    p.add_argument("--container-log-tail", type=int, default=200)
+    p.add_argument("--container-log-lookback", type=float, default=30.0)
     p.add_argument(
         "--dogstatsd-host",
         default="127.0.0.1",
@@ -140,6 +150,7 @@ def _print_status(path, max_age_s):
         f"ticks={r.get('ticks', '-')} host_samples={r.get('host_samples_persisted', '-')} "
         f"system_points={r.get('system_points_persisted', '-')} "
         f"container_points={r.get('container_points_persisted', '-')} "
+        f"logs={r.get('logs_persisted', '-')} "
         f"dogstatsd_points={r.get('statsd_points_persisted', '-')} "
         f"openmetrics_points={r.get('openmetrics_points_persisted', '-')} "
         f"alerts={r.get('alert_events_persisted', '-')} "
@@ -149,6 +160,7 @@ def _print_status(path, max_age_s):
         "last_host_storage_error",
         "last_system_storage_error",
         "last_container_storage_error",
+        "last_log_storage_error",
         "last_statsd_storage_error",
         "last_openmetrics_storage_error",
         "last_alert_error",
@@ -163,6 +175,17 @@ def _print_status(path, max_age_s):
             print(f"container_docker_error={containers['last_docker_error']}")
         if containers.get("last_sample_errors"):
             print("container_sample_errors=" + "; ".join(containers["last_sample_errors"]))
+    logs = r.get("logs")
+    if isinstance(logs, dict):
+        buffer = logs.get("buffer") or {}
+        print(
+            f"container_logs=collected:{logs.get('records_collected', 0)} "
+            f"queued:{buffer.get('queued_records', 0)} dropped:{buffer.get('dropped_records', 0)}"
+        )
+        if logs.get("last_docker_error"):
+            print(f"container_logs_docker_error={logs['last_docker_error']}")
+        if logs.get("last_sample_errors"):
+            print("container_logs_sample_errors=" + "; ".join(logs["last_sample_errors"]))
     openmetrics = r.get("openmetrics")
     if isinstance(openmetrics, dict):
         if openmetrics.get("last_docker_error"):
@@ -199,6 +222,14 @@ def _runtime_for(store, args):
             interval_s=args.container_interval,
             max_containers=args.container_max,
         )
+    logs = None
+    if args.container_logs:
+        logs = ContainerLogWorker(
+            interval_s=args.container_log_interval,
+            max_containers=args.container_log_max_containers,
+            tail=args.container_log_tail,
+            initial_lookback_s=args.container_log_lookback,
+        )
     statsd = None
     if not args.no_dogstatsd:
         statsd = StatsDMetricsWorker(
@@ -224,8 +255,9 @@ def _runtime_for(store, args):
             Path(args.forwarding_spool).expanduser(),
             reload_interval_s=args.forwarding_reload_interval,
         )
-    return LocalAgentRuntime(
+    return LogAwareAgentRuntime(
         store,
+        log_worker=logs,
         statsd_worker=statsd,
         openmetrics_worker=openmetrics,
         container_worker=containers,
@@ -246,15 +278,12 @@ def _run_agent(args):
     runtime = None
     snapshot = None
     log.info(
-        "starting headless agent; database=%s containers=%s dogstatsd=%s openmetrics=%s alerts=%s forwarding=%s",
+        "starting headless agent; database=%s containers=%s logs=%s dogstatsd=%s openmetrics=%s alerts=%s forwarding=%s",
         database,
         "disabled" if args.no_container_metrics else f"{args.container_interval:g}s",
-        "disabled"
-        if args.no_dogstatsd
-        else f"{args.dogstatsd_host}:{args.dogstatsd_port}",
-        "disabled"
-        if args.no_openmetrics
-        else f"docker-autodiscovery/{args.openmetrics_discovery_interval:g}s",
+        "disabled" if not args.container_logs else f"{args.container_log_interval:g}s/{args.container_log_max_containers} containers",
+        "disabled" if args.no_dogstatsd else f"{args.dogstatsd_host}:{args.dogstatsd_port}",
+        "disabled" if args.no_openmetrics else f"docker-autodiscovery/{args.openmetrics_discovery_interval:g}s",
         "disabled" if args.metric_alerts_config is None else str(args.metric_alerts_config),
         "disabled" if args.no_forwarding else str(args.forwarding_config),
     )
@@ -315,13 +344,13 @@ def _run_agent(args):
         return 1
     if snapshot is not None:
         log.info(
-            "agent stopped; ticks=%d host_samples=%d system_points=%d "
-            "container_points=%d dogstatsd_points=%d openmetrics_points=%d "
-            "alerts=%d self_points=%d",
+            "agent stopped; ticks=%d host_samples=%d system_points=%d container_points=%d "
+            "logs=%d dogstatsd_points=%d openmetrics_points=%d alerts=%d self_points=%d",
             snapshot.ticks,
             snapshot.host_samples_persisted,
             snapshot.system_points_persisted,
             snapshot.container_points_persisted,
+            snapshot.logs_persisted,
             snapshot.statsd_points_persisted,
             snapshot.openmetrics_points_persisted,
             snapshot.alert_events_persisted,
@@ -339,13 +368,18 @@ def main(argv=None):
         or args.status_max_age <= 0
         or args.self_metrics_interval <= 0
         or args.container_interval <= 0
+        or args.container_log_interval <= 0
         or args.dogstatsd_flush_interval <= 0
         or args.openmetrics_discovery_interval <= 0
         or args.forwarding_reload_interval <= 0
     ):
         p.error("intervals must be positive")
-    if args.container_max <= 0:
-        p.error("--container-max must be positive")
+    if args.container_max <= 0 or args.container_log_max_containers <= 0:
+        p.error("container bounds must be positive")
+    if args.container_log_tail <= 0:
+        p.error("--container-log-tail must be positive")
+    if args.container_log_lookback < 0:
+        p.error("--container-log-lookback must be >= 0")
     if args.metric_alerts_max_series <= 0:
         p.error("--metric-alerts-max-series must be positive")
     if not 0 <= args.dogstatsd_port <= 65535:
