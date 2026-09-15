@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QMessageBox, QToolBar
 
 from ..core.alert_runtime import AlertRuntime
 from ..core.alerting import AlertStatus
+from ..core.host_monitor import HostRuntimeWorker
 from ..core.openmetrics import OpenMetricsCollector
 from ..core.openmetrics_runtime import (
     OpenMetricsRuntimeWorker,
@@ -17,18 +18,19 @@ from ..core.openmetrics_runtime import (
 from ..utils.paths import get_alert_config_path
 from .alert_history import AlertHistoryDialog
 from .custom_metrics_explorer import CustomMetricsExplorerDialog
+from .host_metrics_explorer import HostMetricsExplorerDialog
 from .main_window import MainWindow
 from .workload_explorer import WorkloadExplorerDialog
 
 
 class AppMainWindow(MainWindow):
-    """Full desktop window with workload, alerting, and custom-metric runtime."""
+    """Full desktop window with agent-style host/container/check runtimes."""
 
-    CUSTOM_METRIC_DRAIN_MS = 500
-    CUSTOM_METRIC_DRAIN_BATCH = 1000
-    CUSTOM_METRIC_RETENTION_ROWS = 250_000
-    CUSTOM_METRIC_RETENTION_S = 7 * 24 * 60 * 60
-    CUSTOM_METRIC_RETENTION_EVERY_TICKS = 600  # five minutes at 500 ms
+    AGENT_DRAIN_MS = 500
+    BUFFER_DRAIN_BATCH = 1000
+    LOCAL_RETENTION_ROWS = 250_000
+    LOCAL_RETENTION_S = 7 * 24 * 60 * 60
+    RETENTION_EVERY_TICKS = 600  # five minutes at 500 ms
 
     def __init__(self) -> None:
         self.alert_runtime = AlertRuntime(get_alert_config_path())
@@ -42,14 +44,31 @@ class AppMainWindow(MainWindow):
         self.custom_metric_storage_error: str | None = None
         self._openmetrics_target_count = 0
         self._last_containers: tuple = ()
-        self._custom_metric_drain_ticks = 0
+
+        self.host_worker: HostRuntimeWorker | None = None
+        self.host_runtime_error: str | None = None
+        self.host_storage_error: str | None = None
+        self._agent_drain_ticks = 0
 
         super().__init__()
         self._setup_workload_toolbar()
+        self._setup_host_runtime()
         self._setup_openmetrics_runtime()
+        self._setup_agent_drain_timer()
         # Re-run once now that the OpenMetrics worker exists. Docker lifecycle
         # events already funnel through this same refresh path afterwards.
         self._refresh_container_list()
+
+    def _setup_host_runtime(self) -> None:
+        try:
+            worker = HostRuntimeWorker(interval_s=1.0, max_queue=3600)
+            worker.start()
+            self.host_worker = worker
+            self.host_runtime_error = None
+        except Exception as exc:
+            self.host_worker = None
+            self.host_runtime_error = str(exc)
+        self._refresh_host_action()
 
     def _setup_openmetrics_runtime(self) -> None:
         worker = OpenMetricsRuntimeWorker(
@@ -58,12 +77,13 @@ class AppMainWindow(MainWindow):
         )
         worker.start()
         self.openmetrics_worker = worker
-
-        self.custom_metric_drain_timer = QTimer(self)
-        self.custom_metric_drain_timer.setInterval(self.CUSTOM_METRIC_DRAIN_MS)
-        self.custom_metric_drain_timer.timeout.connect(self._drain_custom_metrics)
-        self.custom_metric_drain_timer.start()
         self._sync_openmetrics_targets(self._last_containers)
+
+    def _setup_agent_drain_timer(self) -> None:
+        self.agent_drain_timer = QTimer(self)
+        self.agent_drain_timer.setInterval(self.AGENT_DRAIN_MS)
+        self.agent_drain_timer.timeout.connect(self._drain_agent_buffers)
+        self.agent_drain_timer.start()
 
     def _refresh_container_list(self) -> None:
         """Refresh Docker Explorer and atomically refresh discovered checks."""
@@ -89,48 +109,70 @@ class AppMainWindow(MainWindow):
             self.openmetrics_discovery_errors = (*resolved.errors, str(exc))
         self._refresh_custom_metric_action()
 
-    def _drain_custom_metrics(self) -> None:
-        worker = self.openmetrics_worker
-        if worker is None:
-            return
-
-        # SQLite was opened on the Qt/main thread. Keep all DB writes on that
-        # same thread; the background worker performs only blocking scrape I/O
-        # and bounded buffering.
+    def _drain_agent_buffers(self) -> None:
         store = self.telemetry_store
-        if store is not None:
-            points = worker.drain_points(self.CUSTOM_METRIC_DRAIN_BATCH)
-            if points:
-                try:
-                    store.append_custom_metrics(points)
-                    self.custom_metric_storage_error = None
-                except Exception as exc:
-                    # Preserve points for a later attempt. Requeue itself is
-                    # bounded and may drop the oldest data under sustained DB
-                    # failure rather than growing process memory indefinitely.
-                    worker.requeue_points(points)
-                    self.custom_metric_storage_error = str(exc)
+        self._drain_custom_metrics(store)
+        self._drain_host_metrics(store)
+        self._agent_drain_ticks += 1
 
-            self._custom_metric_drain_ticks += 1
-            if (
-                self._custom_metric_drain_ticks
-                % self.CUSTOM_METRIC_RETENTION_EVERY_TICKS
-                == 0
-            ):
-                try:
-                    store.prune_custom_metrics(
-                        before_timestamp=time.time() - self.CUSTOM_METRIC_RETENTION_S,
-                        max_rows=self.CUSTOM_METRIC_RETENTION_ROWS,
-                    )
-                except Exception as exc:
-                    self.custom_metric_storage_error = str(exc)
+        if store is not None and self._agent_drain_ticks % self.RETENTION_EVERY_TICKS == 0:
+            cutoff = time.time() - self.LOCAL_RETENTION_S
+            try:
+                store.prune_custom_metrics(
+                    before_timestamp=cutoff,
+                    max_rows=self.LOCAL_RETENTION_ROWS,
+                )
+                store.prune_host_samples(
+                    before_timestamp=cutoff,
+                    max_rows=self.LOCAL_RETENTION_ROWS,
+                )
+            except Exception as exc:
+                # Retention failure is visible but must not stop collection.
+                self.custom_metric_storage_error = str(exc)
 
         self._refresh_custom_metric_action()
+        self._refresh_host_action()
+
+    def _drain_custom_metrics(self, store) -> None:
+        worker = self.openmetrics_worker
+        if worker is None or store is None:
+            return
+        points = worker.drain_points(self.BUFFER_DRAIN_BATCH)
+        if not points:
+            return
+        try:
+            store.append_custom_metrics(points)
+            self.custom_metric_storage_error = None
+        except Exception as exc:
+            worker.requeue_points(points)
+            self.custom_metric_storage_error = str(exc)
+
+    def _drain_host_metrics(self, store) -> None:
+        worker = self.host_worker
+        if worker is None or store is None:
+            return
+        samples = worker.drain(self.BUFFER_DRAIN_BATCH)
+        if not samples:
+            return
+        try:
+            store.append_host_samples(samples)
+            self.host_storage_error = None
+        except Exception as exc:
+            worker.requeue_front(samples)
+            self.host_storage_error = str(exc)
 
     def _setup_workload_toolbar(self) -> None:
         toolbar = QToolBar("Container Explorer", self)
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
+
+        self.host_action = QAction("Host", self)
+        self.host_action.setToolTip(
+            "Native host CPU/memory/uptime: Windows Kernel32 或 Linux /proc，不依賴 HWiNFO"
+        )
+        self.host_action.setEnabled(self.telemetry_store is not None)
+        self.host_action.triggered.connect(self._show_host_metrics)
+        toolbar.addAction(self.host_action)
 
         self.workload_action = QAction("進程 / 日誌", self)
         self.workload_action.setToolTip("查看所選容器的進程和 bounded 日誌快照")
@@ -158,10 +200,41 @@ class AppMainWindow(MainWindow):
         toolbar.addAction(self.alert_history_action)
         self._refresh_alert_action()
         self._refresh_custom_metric_action()
+        self._refresh_host_action()
 
         self.container_list.container_selected.connect(
             lambda container_id: self.workload_action.setEnabled(bool(container_id))
         )
+
+    def _refresh_host_action(self) -> None:
+        action = getattr(self, "host_action", None)
+        if action is None:
+            return
+        worker = self.host_worker
+        if worker is None:
+            action.setText("Host unavailable")
+            if self.host_runtime_error:
+                action.setToolTip(self.host_runtime_error)
+            return
+        snapshot = worker.snapshot()
+        stats = snapshot.last_stats
+        if stats is None:
+            action.setText(
+                f"Host starting / {snapshot.queued_samples} queued / {snapshot.dropped_samples} dropped"
+            )
+        else:
+            cpu = "-" if stats.cpu_percent is None else f"{stats.cpu_percent:.1f}%"
+            action.setText(
+                f"Host CPU {cpu} / MEM {stats.memory_percent:.1f}% / "
+                f"{snapshot.dropped_samples} dropped"
+            )
+        details = []
+        if snapshot.last_error:
+            details.append("collector: " + snapshot.last_error)
+        if self.host_storage_error:
+            details.append("storage: " + self.host_storage_error)
+        if details:
+            action.setToolTip("\n".join(details))
 
     def _refresh_custom_metric_action(self) -> None:
         action = getattr(self, "custom_metric_action", None)
@@ -189,9 +262,7 @@ class AppMainWindow(MainWindow):
         action.setText(text)
         details = []
         if self.openmetrics_discovery_errors:
-            details.append(
-                "discovery: " + "; ".join(self.openmetrics_discovery_errors[:3])
-            )
+            details.append("discovery: " + "; ".join(self.openmetrics_discovery_errors[:3]))
         if snapshot.last_error:
             details.append("runtime: " + snapshot.last_error)
         if failed:
@@ -233,9 +304,7 @@ class AppMainWindow(MainWindow):
         session_id = self.data_manager.session_id
         for event in events:
             try:
-                store.append_alert_event(
-                    event, session_id=session_id, container_id=container_id
-                )
+                store.append_alert_event(event, session_id=session_id, container_id=container_id)
                 self.last_alert_storage_error = None
             except Exception as exc:
                 self.last_alert_storage_error = str(exc)
@@ -270,6 +339,12 @@ class AppMainWindow(MainWindow):
                 f"RECOVERED {event.rule_name}: {event.metric}={event.value:g}{suffix}"
             )
 
+    def _show_host_metrics(self) -> None:
+        if self.telemetry_store is None:
+            QMessageBox.warning(self, "Host Metrics", "本機 SQLite 資料庫不可用")
+            return
+        HostMetricsExplorerDialog(self.telemetry_store, self).exec()
+
     def _show_custom_metrics(self) -> None:
         if self.telemetry_store is None:
             QMessageBox.warning(self, "Custom Metrics Explorer", "本機 SQLite 資料庫不可用")
@@ -297,11 +372,18 @@ class AppMainWindow(MainWindow):
         WorkloadExplorerDialog(client, container_id, parent=self).exec()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        timer = getattr(self, "custom_metric_drain_timer", None)
+        timer = getattr(self, "agent_drain_timer", None)
         if timer is not None:
             timer.stop()
-        worker = self.openmetrics_worker
+
+        host_worker = self.host_worker
+        self.host_worker = None
+        if host_worker is not None:
+            host_worker.stop(timeout_s=2.0)
+
+        openmetrics_worker = self.openmetrics_worker
         self.openmetrics_worker = None
-        if worker is not None:
-            worker.stop(timeout_s=6.0)
+        if openmetrics_worker is not None:
+            openmetrics_worker.stop(timeout_s=6.0)
+
         super().closeEvent(event)
