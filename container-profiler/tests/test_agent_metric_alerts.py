@@ -1,7 +1,12 @@
 import json
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from profiler.core.agent_runtime import LocalAgentRuntime
 from profiler.core.custom_metrics import CustomMetricPoint
@@ -67,9 +72,9 @@ def write_config(directory):
     return path
 
 
-def temperature(value, timestamp=100.0):
+def temperature(value, timestamp=None):
     return CustomMetricPoint(
-        timestamp=timestamp,
+        timestamp=time.time() if timestamp is None else timestamp,
         name="custom.temperature",
         value=value,
         tags=("service:api",),
