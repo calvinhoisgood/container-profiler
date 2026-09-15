@@ -9,13 +9,17 @@ from PyQt6.QtWidgets import QMessageBox, QToolBar
 
 from ..core.alert_runtime import AlertRuntime
 from ..core.alerting import AlertStatus
+from ..core.forwarding import DurableDeliveryQueue, DeliveryWorker, HTTPDeliveryTransport
+from ..core.forwarding_config import ForwardingConfig, ForwardingConfigError, load_forwarding_config
 from ..core.host_monitor import HostRuntimeWorker
+from ..core.metric_forwarding import enqueue_metric_points
 from ..core.openmetrics import OpenMetricsCollector
-from ..core.openmetrics_runtime import (
-    OpenMetricsRuntimeWorker,
-    resolve_openmetrics_for_containers,
+from ..core.openmetrics_runtime import OpenMetricsRuntimeWorker, resolve_openmetrics_for_containers
+from ..utils.paths import (
+    get_alert_config_path,
+    get_forwarding_config_path,
+    get_forwarding_db_path,
 )
-from ..utils.paths import get_alert_config_path
 from .alert_history import AlertHistoryDialog
 from .custom_metrics_explorer import CustomMetricsExplorerDialog
 from .host_metrics_explorer import HostMetricsExplorerDialog
@@ -50,10 +54,19 @@ class AppMainWindow(MainWindow):
         self.host_storage_error: str | None = None
         self._agent_drain_ticks = 0
 
+        self.forwarding_config = ForwardingConfig()
+        self.forwarding_config_error: str | None = None
+        self.forwarding_queue: DurableDeliveryQueue | None = None
+        self.delivery_worker: DeliveryWorker | None = None
+        self.forwarding_enqueue_error: str | None = None
+        self.forwarding_points_enqueued = 0
+        self.forwarding_points_dropped = 0
+
         super().__init__()
         self._setup_workload_toolbar()
         self._setup_host_runtime()
         self._setup_openmetrics_runtime()
+        self._reload_forwarding(show_dialog=False)
         self._setup_agent_drain_timer()
         # Re-run once now that the OpenMetrics worker exists. Docker lifecycle
         # events already funnel through this same refresh path afterwards.
@@ -132,6 +145,7 @@ class AppMainWindow(MainWindow):
 
         self._refresh_custom_metric_action()
         self._refresh_host_action()
+        self._refresh_forwarding_action()
 
     def _drain_custom_metrics(self, store) -> None:
         worker = self.openmetrics_worker
@@ -146,6 +160,26 @@ class AppMainWindow(MainWindow):
         except Exception as exc:
             worker.requeue_points(points)
             self.custom_metric_storage_error = str(exc)
+            return
+
+        # Remote delivery is deliberately downstream of durable local storage.
+        # A remote outage can therefore never make local Explorer history vanish.
+        queue = self.forwarding_queue
+        if self.forwarding_config.enabled and queue is not None:
+            try:
+                result = enqueue_metric_points(
+                    queue,
+                    points,
+                    max_points_per_batch=self.forwarding_config.batch_points,
+                    max_payload_bytes=self.forwarding_config.max_payload_bytes,
+                )
+                self.forwarding_points_enqueued += result.points_enqueued
+                self.forwarding_points_dropped += result.points_dropped
+                self.forwarding_enqueue_error = None
+            except Exception as exc:
+                # Local persistence has already succeeded. Forwarding failure is
+                # reported independently and must not re-ingest duplicate points.
+                self.forwarding_enqueue_error = str(exc)
 
     def _drain_host_metrics(self, store) -> None:
         worker = self.host_worker
@@ -188,6 +222,13 @@ class AppMainWindow(MainWindow):
         self.custom_metric_action.triggered.connect(self._show_custom_metrics)
         toolbar.addAction(self.custom_metric_action)
 
+        self.forwarding_action = QAction("Forwarding disabled", self)
+        self.forwarding_action.setToolTip(
+            f"遠端轉送預設停用。配置: {get_forwarding_config_path()}\n點擊重新載入配置"
+        )
+        self.forwarding_action.triggered.connect(self._reload_forwarding)
+        toolbar.addAction(self.forwarding_action)
+
         self.alert_action = QAction(self)
         self.alert_action.setToolTip(f"告警配置: {get_alert_config_path()}\n點擊強制重新載入")
         self.alert_action.triggered.connect(self._reload_alerts)
@@ -201,10 +242,103 @@ class AppMainWindow(MainWindow):
         self._refresh_alert_action()
         self._refresh_custom_metric_action()
         self._refresh_host_action()
+        self._refresh_forwarding_action()
 
         self.container_list.container_selected.connect(
             lambda container_id: self.workload_action.setEnabled(bool(container_id))
         )
+
+    def _install_forwarding_config(self, config: ForwardingConfig) -> None:
+        new_queue = None
+        new_worker = None
+        if config.enabled:
+            new_queue = DurableDeliveryQueue(
+                get_forwarding_db_path(),
+                max_items=config.queue_max_items,
+                max_bytes=config.queue_max_bytes,
+                max_payload_bytes=config.max_payload_bytes,
+            )
+            transport = HTTPDeliveryTransport(
+                config.endpoints,
+                timeout_s=config.timeout_s,
+                headers=config.header_mapping,
+            )
+            new_worker = DeliveryWorker(
+                new_queue,
+                transport,
+                batch_size=100,
+                poll_interval_s=config.poll_interval_s,
+                base_delay_s=config.base_delay_s,
+                max_delay_s=config.max_delay_s,
+                jitter=config.jitter,
+            )
+
+        old_worker = self.delivery_worker
+        old_queue = self.forwarding_queue
+        if old_worker is not None:
+            old_worker.stop(timeout_s=6.0)
+        if old_queue is not None:
+            old_queue.close()
+
+        self.forwarding_config = config
+        self.forwarding_queue = new_queue
+        self.delivery_worker = new_worker
+        if new_worker is not None:
+            new_worker.start()
+
+    def _reload_forwarding(self, checked: bool = False, *, show_dialog: bool = True) -> None:
+        del checked
+        try:
+            config = load_forwarding_config(get_forwarding_config_path())
+            # Build the new queue/worker before replacing the currently working
+            # runtime. Invalid config therefore has last-known-good semantics.
+            self._install_forwarding_config(config)
+            self.forwarding_config_error = None
+        except (ForwardingConfigError, OSError, ValueError) as exc:
+            self.forwarding_config_error = str(exc)
+            if show_dialog:
+                QMessageBox.warning(
+                    self,
+                    "Forwarding 配置無效",
+                    "已保留目前 forwarding runtime。\n\n" + self.forwarding_config_error,
+                )
+        self._refresh_forwarding_action()
+
+    def _refresh_forwarding_action(self) -> None:
+        action = getattr(self, "forwarding_action", None)
+        if action is None:
+            return
+        if self.forwarding_config_error:
+            action.setText("Forwarding config error")
+            action.setToolTip(
+                f"{self.forwarding_config_error}\n配置: {get_forwarding_config_path()}"
+            )
+            return
+        worker = self.delivery_worker
+        queue = self.forwarding_queue
+        if not self.forwarding_config.enabled or worker is None or queue is None:
+            action.setText("Forwarding disabled")
+            action.setToolTip(
+                f"遠端轉送預設停用。配置: {get_forwarding_config_path()}\n點擊重新載入配置"
+            )
+            return
+        snapshot = worker.snapshot()
+        oldest = snapshot.queue.oldest_age_s
+        age_text = "-" if oldest is None else f"{oldest:.0f}s"
+        action.setText(
+            f"Forward {snapshot.queue.queued_items} queued / {snapshot.queue.dropped_items} dropped"
+        )
+        details = [
+            f"spool: {snapshot.queue.queued_bytes} bytes; oldest {age_text}",
+            f"delivered: {snapshot.queue.delivered_items}; failed attempts: {snapshot.queue.failed_attempts}",
+            f"metric points enqueued: {self.forwarding_points_enqueued}; dropped before spool: {self.forwarding_points_dropped}",
+            f"config: {get_forwarding_config_path()}",
+        ]
+        if snapshot.last_error:
+            details.insert(0, "last error: " + snapshot.last_error)
+        if self.forwarding_enqueue_error:
+            details.insert(0, "enqueue: " + self.forwarding_enqueue_error)
+        action.setToolTip("\n".join(details))
 
     def _refresh_host_action(self) -> None:
         action = getattr(self, "host_action", None)
@@ -225,8 +359,7 @@ class AppMainWindow(MainWindow):
         else:
             cpu = "-" if stats.cpu_percent is None else f"{stats.cpu_percent:.1f}%"
             action.setText(
-                f"Host CPU {cpu} / MEM {stats.memory_percent:.1f}% / "
-                f"{snapshot.dropped_samples} dropped"
+                f"Host CPU {cpu} / MEM {stats.memory_percent:.1f}% / {snapshot.dropped_samples} dropped"
             )
         details = []
         if snapshot.last_error:
@@ -254,8 +387,7 @@ class AppMainWindow(MainWindow):
         )
         text = (
             f"自訂指標 {self._openmetrics_target_count} checks / "
-            f"{snapshot.buffer.queued_points} queued / "
-            f"{snapshot.buffer.dropped_points} dropped"
+            f"{snapshot.buffer.queued_points} queued / {snapshot.buffer.dropped_points} dropped"
         )
         if degraded:
             text += " / degraded"
@@ -375,6 +507,15 @@ class AppMainWindow(MainWindow):
         timer = getattr(self, "agent_drain_timer", None)
         if timer is not None:
             timer.stop()
+
+        delivery_worker = self.delivery_worker
+        self.delivery_worker = None
+        if delivery_worker is not None:
+            delivery_worker.stop(timeout_s=6.0)
+        queue = self.forwarding_queue
+        self.forwarding_queue = None
+        if queue is not None:
+            queue.close()
 
         host_worker = self.host_worker
         self.host_worker = None
