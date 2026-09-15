@@ -1,4 +1,4 @@
-"""Durable local telemetry store backed by SQLite.
+"""Durable local telemetry and alert store backed by SQLite.
 
 The store is intentionally independent from Qt and Docker so it can be used by
 future agent/service and GUI processes. WAL mode allows a writer and explorers
@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .alerting import AlertEvent
+
 
 class SQLiteTelemetryStore:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
@@ -72,6 +75,29 @@ class SQLiteTelemetryStore:
                 ON samples(session_id, elapsed_s);
             CREATE INDEX IF NOT EXISTS idx_samples_timestamp
                 ON samples(timestamp);
+            CREATE TABLE IF NOT EXISTS alert_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                container_id TEXT,
+                timestamp REAL NOT NULL,
+                rule_name TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                previous_status TEXT NOT NULL,
+                current_status TEXT NOT NULL,
+                value REAL,
+                message TEXT NOT NULL,
+                acknowledged_at TEXT,
+                acknowledged_by TEXT,
+                note TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_alert_events_timestamp
+                ON alert_events(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_alert_events_filters
+                ON alert_events(current_status, severity, rule_name);
+            CREATE INDEX IF NOT EXISTS idx_alert_events_session
+                ON alert_events(session_id, timestamp DESC);
             """
         )
         self._db.execute(
@@ -187,6 +213,99 @@ class SQLiteTelemetryStore:
             params,
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def append_alert_event(
+        self,
+        event: AlertEvent,
+        *,
+        session_id: str | None = None,
+        container_id: str | None = None,
+    ) -> int:
+        """Persist one alert state transition and return its stable event id."""
+        with self._db:
+            cursor = self._db.execute(
+                """
+                INSERT INTO alert_events(
+                    session_id, container_id, timestamp, rule_name, metric, severity,
+                    previous_status, current_status, value, message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    container_id,
+                    float(event.timestamp),
+                    event.rule_name,
+                    event.metric,
+                    event.severity,
+                    event.previous.value,
+                    event.current.value,
+                    event.value,
+                    event.message,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def query_alert_events(
+        self,
+        *,
+        session_id: str | None = None,
+        container_id: str | None = None,
+        rule_name: str | None = None,
+        severity: str | None = None,
+        current_status: str | None = None,
+        acknowledged: bool | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return newest alert transitions matching bounded explorer filters."""
+        if limit <= 0:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("session_id", session_id),
+            ("container_id", container_id),
+            ("rule_name", rule_name),
+            ("severity", severity),
+            ("current_status", current_status),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        if acknowledged is True:
+            clauses.append("acknowledged_at IS NOT NULL")
+        elif acknowledged is False:
+            clauses.append("acknowledged_at IS NULL")
+        where = "" if not clauses else "WHERE " + " AND ".join(clauses)
+        params.append(limit)
+        rows = self._db.execute(
+            "SELECT id, session_id, container_id, timestamp, rule_name, metric, severity, "
+            "previous_status, current_status, value, message, acknowledged_at, "
+            f"acknowledged_by, note FROM alert_events {where} "
+            "ORDER BY timestamp DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_alert_event(
+        self,
+        event_id: int,
+        *,
+        acknowledged_by: str | None = None,
+        note: str | None = None,
+        acknowledged_at: str | None = None,
+    ) -> bool:
+        """Acknowledge one transition once; repeated acknowledgement is idempotent."""
+        when = acknowledged_at or datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        with self._db:
+            cursor = self._db.execute(
+                """
+                UPDATE alert_events
+                SET acknowledged_at=?, acknowledged_by=?, note=?
+                WHERE id=? AND acknowledged_at IS NULL
+                """,
+                (when, acknowledged_by, note, int(event_id)),
+            )
+        return cursor.rowcount == 1
 
     def delete_session(self, session_id: str) -> bool:
         with self._db:
