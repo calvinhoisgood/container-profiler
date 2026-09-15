@@ -20,6 +20,15 @@ from typing import Any, Callable, Protocol
 _MIB = 1024.0 * 1024.0
 
 
+def _native_loadavg() -> tuple[float, float, float]:
+    """Call getloadavg lazily so importing this module is safe on Windows."""
+    func = getattr(os, "getloadavg", None)
+    if func is None:
+        raise OSError("load average is unavailable on this platform")
+    values = func()
+    return float(values[0]), float(values[1]), float(values[2])
+
+
 @dataclass(frozen=True, slots=True)
 class HostRawSample:
     timestamp: float
@@ -154,7 +163,7 @@ class LinuxProcHostBackend:
         *,
         reader: Callable[[str], str] | None = None,
         wall_clock: Callable[[], float] = time.time,
-        loadavg: Callable[[], tuple[float, float, float]] = os.getloadavg,
+        loadavg: Callable[[], tuple[float, float, float]] = _native_loadavg,
         cpu_count: Callable[[], int | None] = os.cpu_count,
     ) -> None:
         self.reader = reader or (lambda path: Path(path).read_text(encoding="utf-8"))
