@@ -1,17 +1,27 @@
-"""OpenMetrics Autodiscovery config and bounded check scheduling.
+"""OpenMetrics Autodiscovery, target resolution and bounded runtime scheduling.
 
-This layer converts Datadog-compatible Docker labels into safe, normalized
-OpenMetrics targets and owns deterministic scheduling/health accounting. It is
-independent from Docker and Qt so it can be used by the desktop app or a future
-background agent process.
+This layer converts Datadog-compatible Docker labels into safe normalized
+OpenMetrics targets, resolves Docker inspect network metadata, and provides a
+background worker with bounded custom-metric buffering. It is independent from
+Qt so the same runtime can later move into a Windows service/agent process.
 """
 from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
+
+from .container_context import ContainerTemplateContext
+from .custom_metrics import (
+    BoundedMetricBuffer,
+    CustomMetricPoint,
+    MetricBufferStats,
+    normalize_openmetrics_samples,
+)
 
 AD_CHECKS_LABEL = "com.datadoghq.ad.checks"
 AD_CHECK_NAMES_LABEL = "com.datadoghq.ad.check_names"
@@ -20,10 +30,15 @@ AD_INSTANCES_LABEL = "com.datadoghq.ad.instances"
 DEFAULT_INTERVAL_S = 15.0
 DEFAULT_MAX_RETURNED_METRICS = 2000
 MAX_TARGETS_PER_CONTAINER = 16
+MAX_TOTAL_TARGETS = 512
+MAX_DISCOVERY_ERRORS = 256
 MAX_METRIC_PATTERNS = 256
 MAX_TAGS = 128
-_TOKEN_RE = re.compile(r"%%[^%]+%%")
+_TOKEN_RE = re.compile(r"%%([^%]+)%%")
+_HOST_NETWORK_TOKEN_RE = re.compile(r"^host_(.+)$")
+_PORT_INDEX_TOKEN_RE = re.compile(r"^port_(\d+)$")
 _METRIC_NAME = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
+_PENDING_UNSET = object()
 
 
 class OpenMetricsDiscoveryError(ValueError):
@@ -40,18 +55,26 @@ class OpenMetricsTargetTemplate:
     interval_s: float = DEFAULT_INTERVAL_S
     max_samples: int = DEFAULT_MAX_RETURNED_METRICS
     tags: tuple[str, ...] = ()
+    container_id: str | None = None
 
     def resolve(
         self,
         *,
-        host: str,
+        host: str | None = None,
         port: int | None = None,
+        context: ContainerTemplateContext | None = None,
         allow_external: bool = False,
     ) -> "OpenMetricsTarget":
+        if context is None:
+            context = ContainerTemplateContext(
+                primary_host=host,
+                network_hosts=(("default", host),) if host else (),
+                ports=(int(port),) if port is not None else (),
+            )
         url = resolve_endpoint_template(
             self.endpoint_template,
-            host=host,
-            port=port,
+            context=context,
+            port_override=port,
             allow_external=allow_external,
         )
         return OpenMetricsTarget(
@@ -63,6 +86,7 @@ class OpenMetricsTargetTemplate:
             interval_s=self.interval_s,
             max_samples=self.max_samples,
             tags=self.tags,
+            container_id=self.container_id,
         )
 
 
@@ -76,11 +100,18 @@ class OpenMetricsTarget:
     interval_s: float = DEFAULT_INTERVAL_S
     max_samples: int = DEFAULT_MAX_RETURNED_METRICS
     tags: tuple[str, ...] = ()
+    container_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class OpenMetricsDiscoveryResult:
     targets: tuple[OpenMetricsTargetTemplate, ...]
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class OpenMetricsResolvedSet:
+    targets: tuple[OpenMetricsTarget, ...]
     errors: tuple[str, ...] = ()
 
 
@@ -100,6 +131,15 @@ class OpenMetricsTargetHealth:
 class OpenMetricsScrapeBatch:
     target: OpenMetricsTarget
     result: Any
+
+
+@dataclass(frozen=True, slots=True)
+class OpenMetricsWorkerSnapshot:
+    running: bool
+    ticks: int
+    target_health: tuple[OpenMetricsTargetHealth, ...]
+    buffer: MetricBufferStats
+    last_error: str | None = None
 
 
 def _load_json(value: str, *, label: str) -> Any:
@@ -138,6 +178,8 @@ def _parse_metrics(raw: Any) -> tuple[tuple[str, ...], tuple[tuple[str, str], ..
             if not isinstance(pattern, str):
                 raise OpenMetricsDiscoveryError("metric mapping key must be a string")
             if isinstance(destination, str):
+                if not destination or not _METRIC_NAME.fullmatch(destination):
+                    raise OpenMetricsDiscoveryError("metric alias must be a valid metric name")
                 renames.append((pattern, destination))
             elif destination is not None and not isinstance(destination, dict):
                 raise OpenMetricsDiscoveryError("unsupported metric mapping value")
@@ -167,6 +209,7 @@ def _parse_instance(
     instance: Any,
     *,
     key: str,
+    container_id: str,
     inherited_tags: Iterable[str],
 ) -> OpenMetricsTargetTemplate:
     instance = _decode_nested_json(instance)
@@ -201,7 +244,7 @@ def _parse_instance(
         max_samples = int(max_raw)
     except (TypeError, ValueError) as exc:
         raise OpenMetricsDiscoveryError("max_returned_metrics must be an integer") from exc
-    if max_samples <= 0 or max_samples > 10000:
+    if max_samples <= 0 or max_samples > 10_000:
         raise OpenMetricsDiscoveryError("max_returned_metrics must be between 1 and 10000")
 
     return OpenMetricsTargetTemplate(
@@ -213,6 +256,7 @@ def _parse_instance(
         interval_s=interval_s,
         max_samples=max_samples,
         tags=_parse_tags(instance.get("tags"), inherited_tags),
+        container_id=container_id,
     )
 
 
@@ -256,12 +300,7 @@ def discover_openmetrics_targets(
     container_key: str,
     inherited_tags: Iterable[str] = (),
 ) -> OpenMetricsDiscoveryResult:
-    """Parse v2 or legacy Datadog Docker labels into bounded target templates.
-
-    V2 ``com.datadoghq.ad.checks`` takes precedence when it contains an
-    OpenMetrics check. Invalid instances are isolated and reported rather than
-    preventing other valid endpoints from being scheduled.
-    """
+    """Parse v2 or legacy Datadog Docker labels into bounded target templates."""
     normalized = {
         str(key): str(value)
         for key, value in (labels or {}).items()
@@ -287,6 +326,7 @@ def discover_openmetrics_targets(
                 _parse_instance(
                     instance,
                     key=f"{container_key}:openmetrics:{index}",
+                    container_id=container_key,
                     inherited_tags=inherited_tags,
                 )
             )
@@ -295,60 +335,164 @@ def discover_openmetrics_targets(
     return OpenMetricsDiscoveryResult(tuple(targets), tuple(errors))
 
 
+def _url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 def resolve_endpoint_template(
     endpoint_template: str,
     *,
-    host: str,
+    host: str | None = None,
     port: int | None = None,
+    context: ContainerTemplateContext | None = None,
+    port_override: int | None = None,
     allow_external: bool = False,
 ) -> str:
-    """Resolve Datadog ``%%host%%``/``%%port%%`` with an SSRF-safe default.
+    """Resolve Datadog Docker template variables with an SSRF-safe default.
 
-    Label-controlled Autodiscovery is untrusted input. Unless explicitly
-    opted out, the URL hostname must be ``%%host%%`` so a container cannot make
-    the desktop agent probe arbitrary hosts or cloud metadata services.
+    Supported variables are ``%%host%%``, ``%%host_<NETWORK>%%``, ``%%port%%``,
+    numeric ``%%port_N%%``, ``%%hostname%%`` and ``%%pid%%``. Datadog defines
+    ``%%port%%`` as the highest exposed port and indexed ports in ascending
+    numeric order. A missing named network falls back to ``%%host%%``.
+
+    Label-controlled checks are untrusted input. Unless ``allow_external`` is
+    explicitly enabled, the final URL hostname must be one of the IP addresses
+    Docker discovered for this container. This prevents labels from turning the
+    desktop agent into an arbitrary HTTP/metadata-network probe.
     """
-    if not host or any(char.isspace() for char in host):
-        raise OpenMetricsDiscoveryError("container host is empty or invalid")
-    if port is not None and not 1 <= int(port) <= 65535:
-        raise OpenMetricsDiscoveryError("container port must be between 1 and 65535")
+    if context is None:
+        chosen_port = port_override if port_override is not None else port
+        context = ContainerTemplateContext(
+            primary_host=host,
+            network_hosts=(("default", host),) if host else (),
+            ports=(int(chosen_port),) if chosen_port is not None else (),
+        )
+    elif port_override is None and port is not None:
+        port_override = port
 
-    probe = endpoint_template.replace("%%host%%", "container.invalid")
-    probe = probe.replace("%%port%%", "65535")
-    parsed_probe = urlsplit(probe)
-    if parsed_probe.scheme not in {"http", "https"} or not parsed_probe.hostname:
-        raise OpenMetricsDiscoveryError("endpoint must be an absolute http(s) URL")
-    if parsed_probe.username is not None or parsed_probe.password is not None:
-        raise OpenMetricsDiscoveryError("endpoint credentials are not allowed in labels")
-    if parsed_probe.fragment:
-        raise OpenMetricsDiscoveryError("endpoint fragments are not supported")
-    if not allow_external and parsed_probe.hostname != "container.invalid":
-        raise OpenMetricsDiscoveryError("autodiscovery endpoint must use %%host%%")
-    if "%%port%%" in endpoint_template and port is None:
-        raise OpenMetricsDiscoveryError("endpoint requires %%port%% but no port was supplied")
+    ports = tuple(sorted(set(int(value) for value in context.ports if 1 <= int(value) <= 65535)))
+    if port_override is not None:
+        if not 1 <= int(port_override) <= 65535:
+            raise OpenMetricsDiscoveryError("container port must be between 1 and 65535")
+        default_port = int(port_override)
+    else:
+        default_port = ports[-1] if ports else None
 
-    rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    rendered = endpoint_template.replace("%%host%%", rendered_host)
-    if port is not None:
-        rendered = rendered.replace("%%port%%", str(int(port)))
-    token = _TOKEN_RE.search(rendered)
-    if token:
-        raise OpenMetricsDiscoveryError(f"unsupported template variable: {token.group(0)}")
+    allowed_hosts = {value for _, value in context.network_hosts if value}
+    if context.primary_host:
+        allowed_hosts.add(context.primary_host)
 
+    def render_token(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token == "host":
+            value = context.primary_host
+            if not value:
+                raise OpenMetricsDiscoveryError(
+                    "endpoint requires %%host%% but no container IP was discovered"
+                )
+            return _url_host(value)
+
+        network_match = _HOST_NETWORK_TOKEN_RE.fullmatch(token)
+        if network_match:
+            network_name = network_match.group(1)
+            value = context.host_for_network(network_name)
+            if not value:
+                raise OpenMetricsDiscoveryError(
+                    f"endpoint requires %%host_{network_name}%% but no container IP was discovered"
+                )
+            return _url_host(value)
+
+        if token == "port":
+            if default_port is None:
+                raise OpenMetricsDiscoveryError(
+                    "endpoint requires %%port%% but no exposed port was discovered"
+                )
+            return str(default_port)
+
+        port_match = _PORT_INDEX_TOKEN_RE.fullmatch(token)
+        if port_match:
+            index = int(port_match.group(1))
+            if index >= len(ports):
+                raise OpenMetricsDiscoveryError(
+                    f"endpoint port index {index} is unavailable"
+                )
+            return str(ports[index])
+
+        if token == "hostname":
+            if not context.hostname:
+                raise OpenMetricsDiscoveryError(
+                    "endpoint requires %%hostname%% but no container hostname was discovered"
+                )
+            return context.hostname
+
+        if token == "pid":
+            if context.pid is None:
+                raise OpenMetricsDiscoveryError(
+                    "endpoint requires %%pid%% but no container pid was discovered"
+                )
+            return str(context.pid)
+
+        raise OpenMetricsDiscoveryError(f"unsupported template variable: %%{token}%%")
+
+    rendered = _TOKEN_RE.sub(render_token, endpoint_template)
     parsed = urlsplit(rendered)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise OpenMetricsDiscoveryError("resolved endpoint is not an absolute http(s) URL")
+        raise OpenMetricsDiscoveryError("endpoint must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise OpenMetricsDiscoveryError("endpoint credentials are not allowed in labels")
+    if parsed.fragment:
+        raise OpenMetricsDiscoveryError("endpoint fragments are not supported")
+    if not allow_external and parsed.hostname not in allowed_hosts:
+        raise OpenMetricsDiscoveryError(
+            "autodiscovery endpoint must resolve to a discovered container IP"
+        )
     return rendered
 
 
-class OpenMetricsCheckScheduler:
-    """Deterministic bounded scheduler for dynamically discovered targets.
+def resolve_openmetrics_for_containers(
+    containers: Iterable[Any],
+) -> OpenMetricsResolvedSet:
+    """Discover and resolve checks for running ``ContainerInfo`` snapshots."""
+    targets: list[OpenMetricsTarget] = []
+    errors: list[str] = []
 
-    Scrapes run synchronously in the caller's worker context. A slow endpoint
-    therefore cannot create overlapping work or a catch-up storm: after each
-    attempt its next deadline is ``now + interval``. The GUI/runtime layer can
-    execute :meth:`run_due` in a background thread.
-    """
+    for container in containers:
+        if str(getattr(container, "status", "")) != "running":
+            continue
+        container_id = str(getattr(container, "id", ""))
+        labels = dict(getattr(container, "labels", ()) or ())
+        discovery = discover_openmetrics_targets(
+            labels,
+            container_key=container_id,
+            inherited_tags=tuple(getattr(container, "tags", ()) or ()),
+        )
+        for error in discovery.errors:
+            if len(errors) < MAX_DISCOVERY_ERRORS:
+                errors.append(f"{container_id[:12]}: {error}")
+
+        context = ContainerTemplateContext(
+            primary_host=getattr(container, "primary_host", None),
+            network_hosts=tuple(getattr(container, "network_hosts", ()) or ()),
+            ports=tuple(getattr(container, "exposed_ports", ()) or ()),
+            hostname=getattr(container, "hostname", None),
+            pid=getattr(container, "pid", None),
+        )
+        for template in discovery.targets:
+            if len(targets) >= MAX_TOTAL_TARGETS:
+                if len(errors) < MAX_DISCOVERY_ERRORS:
+                    errors.append(f"global OpenMetrics target limit {MAX_TOTAL_TARGETS} reached")
+                return OpenMetricsResolvedSet(tuple(targets), tuple(errors))
+            try:
+                targets.append(template.resolve(context=context))
+            except OpenMetricsDiscoveryError as exc:
+                if len(errors) < MAX_DISCOVERY_ERRORS:
+                    errors.append(f"{container_id[:12]}: {template.key}: {exc}")
+
+    return OpenMetricsResolvedSet(tuple(targets), tuple(errors))
+
+
+class OpenMetricsCheckScheduler:
+    """Deterministic bounded scheduler for dynamically discovered targets."""
 
     def __init__(self, collector: Any) -> None:
         self.collector = collector
@@ -376,6 +520,11 @@ class OpenMetricsCheckScheduler:
     def snapshot(self) -> tuple[OpenMetricsTargetHealth, ...]:
         return tuple(self._health[key] for key in sorted(self._health))
 
+    def next_due(self) -> float | None:
+        if not self._health:
+            return None
+        return min(item.next_due for item in self._health.values())
+
     def run_due(self, *, now: float) -> tuple[OpenMetricsScrapeBatch, ...]:
         batches: list[OpenMetricsScrapeBatch] = []
         for key in sorted(self._targets):
@@ -385,10 +534,12 @@ class OpenMetricsCheckScheduler:
                 continue
             next_due = float(now) + target.interval_s
             try:
+                # Keep exposition names raw here. Namespace and aliases are
+                # applied by the normalized custom-metric pipeline afterwards.
                 result = self.collector.scrape(
                     target.url,
                     metric_patterns=target.metric_patterns,
-                    namespace=target.namespace,
+                    namespace="",
                     max_samples=target.max_samples,
                 )
             except Exception as exc:
@@ -413,3 +564,179 @@ class OpenMetricsCheckScheduler:
             )
             batches.append(OpenMetricsScrapeBatch(target=target, result=result))
         return tuple(batches)
+
+
+class OpenMetricsRuntime:
+    """Deterministic scheduler + normalization + bounded buffer composition."""
+
+    def __init__(
+        self,
+        collector: Any,
+        *,
+        buffer: BoundedMetricBuffer | None = None,
+    ) -> None:
+        self.scheduler = OpenMetricsCheckScheduler(collector)
+        self.buffer = buffer or BoundedMetricBuffer()
+        self.ticks = 0
+
+    def replace_targets(self, targets: Iterable[OpenMetricsTarget], *, now: float) -> None:
+        self.scheduler.replace_targets(targets, now=now)
+
+    def tick(self, *, now: float, wall_time: float) -> tuple[OpenMetricsScrapeBatch, ...]:
+        batches = self.scheduler.run_due(now=now)
+        for batch in batches:
+            self.buffer.append_many(
+                normalize_openmetrics_samples(
+                    batch.target,
+                    batch.result,
+                    collected_at=wall_time,
+                )
+            )
+        self.ticks += 1
+        return batches
+
+
+class OpenMetricsRuntimeWorker:
+    """Background worker for scrape I/O with cooperative target hot-reload.
+
+    Docker/HTTP calls never execute on the Qt main thread. Target updates are
+    coalesced to the newest snapshot. Collected points enter a bounded queue
+    that consumers can drain and, on a failed delivery, requeue at the front.
+    """
+
+    def __init__(
+        self,
+        collector: Any,
+        *,
+        buffer: BoundedMetricBuffer | None = None,
+        monotonic_clock=time.monotonic,
+        wall_clock=time.time,
+        max_idle_wait_s: float = 1.0,
+    ) -> None:
+        if max_idle_wait_s <= 0:
+            raise ValueError("max_idle_wait_s must be positive")
+        self.runtime = OpenMetricsRuntime(collector, buffer=buffer)
+        self._monotonic_clock = monotonic_clock
+        self._wall_clock = wall_clock
+        self._max_idle_wait_s = float(max_idle_wait_s)
+        self._condition = threading.Condition()
+        self._pending_targets: object | tuple[OpenMetricsTarget, ...] = _PENDING_UNSET
+        self._stop_requested = False
+        self._thread: threading.Thread | None = None
+        self._snapshot_lock = threading.Lock()
+        self._last_health: tuple[OpenMetricsTargetHealth, ...] = ()
+        self._last_error: str | None = None
+
+    @property
+    def buffer(self) -> BoundedMetricBuffer:
+        return self.runtime.buffer
+
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self) -> None:
+        with self._condition:
+            if self.is_running():
+                return
+            self._stop_requested = False
+            thread = threading.Thread(
+                target=self._run,
+                name="openmetrics-runtime",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+
+    def replace_targets(self, targets: Iterable[OpenMetricsTarget]) -> None:
+        values = tuple(targets)
+        keys = [target.key for target in values]
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate OpenMetrics target key")
+        with self._condition:
+            self._pending_targets = values
+            self._condition.notify_all()
+
+    def drain_points(self, limit: int = 1000) -> tuple[CustomMetricPoint, ...]:
+        return self.buffer.drain(limit)
+
+    def requeue_points(self, points: Iterable[CustomMetricPoint]) -> int:
+        return self.buffer.requeue_front(points)
+
+    def snapshot(self) -> OpenMetricsWorkerSnapshot:
+        with self._snapshot_lock:
+            health = self._last_health
+            last_error = self._last_error
+        return OpenMetricsWorkerSnapshot(
+            running=self.is_running(),
+            ticks=self.runtime.ticks,
+            target_health=health,
+            buffer=self.buffer.stats(),
+            last_error=last_error,
+        )
+
+    def stop(self, timeout_s: float = 6.0) -> bool:
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(max(0.0, timeout_s))
+        stopped = not thread.is_alive()
+        if stopped:
+            self._thread = None
+        return stopped
+
+    def _take_pending_targets(self) -> object | tuple[OpenMetricsTarget, ...]:
+        with self._condition:
+            pending = self._pending_targets
+            self._pending_targets = _PENDING_UNSET
+            return pending
+
+    def _set_snapshot_error(self, error: str | None) -> None:
+        with self._snapshot_lock:
+            self._last_health = self.runtime.scheduler.snapshot()
+            self._last_error = error
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                if self._stop_requested:
+                    break
+
+            pending = self._take_pending_targets()
+            if pending is not _PENDING_UNSET:
+                self.runtime.replace_targets(
+                    pending,
+                    now=float(self._monotonic_clock()),
+                )
+
+            try:
+                now = float(self._monotonic_clock())
+                self.runtime.tick(now=now, wall_time=float(self._wall_clock()))
+                self._set_snapshot_error(None)
+            except Exception as exc:
+                # A programming/data-normalization failure must degrade the
+                # custom-metric subsystem rather than killing the whole app.
+                self._set_snapshot_error(str(exc))
+
+            next_due = self.runtime.scheduler.next_due()
+            if next_due is None:
+                wait_s = self._max_idle_wait_s
+            else:
+                wait_s = min(
+                    self._max_idle_wait_s,
+                    max(0.0, next_due - float(self._monotonic_clock())),
+                )
+                if wait_s == 0:
+                    # Avoid a CPU spin when a custom clock does not advance.
+                    wait_s = min(0.01, self._max_idle_wait_s)
+
+            with self._condition:
+                if self._stop_requested:
+                    break
+                if self._pending_targets is _PENDING_UNSET:
+                    self._condition.wait(wait_s)
+
+        self._set_snapshot_error(self._last_error)
