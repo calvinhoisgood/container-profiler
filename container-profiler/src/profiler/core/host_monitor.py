@@ -7,11 +7,13 @@ optional power-sensor provider elsewhere in the application.
 """
 from __future__ import annotations
 
+from collections import deque
 import ctypes
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Callable, Protocol
 
@@ -45,6 +47,17 @@ class HostStats:
     load_1: float | None = None
     load_5: float | None = None
     load_15: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HostWorkerSnapshot:
+    running: bool
+    samples_collected: int
+    failed_samples: int
+    queued_samples: int
+    dropped_samples: int
+    last_error: str | None
+    last_stats: HostStats | None
 
 
 class HostBackend(Protocol):
@@ -173,7 +186,6 @@ class LinuxProcHostBackend:
                 amount = int(fields[0])
             except ValueError:
                 continue
-            # procfs memory values are kB on Linux.
             values[key] = amount * 1024
         total = values.get("MemTotal")
         if not total:
@@ -263,3 +275,136 @@ class NativeHostMonitor:
 
     def reset_cpu_baseline(self) -> None:
         self._previous_cpu = None
+
+
+class HostRuntimeWorker:
+    """Continuously collect host checks independent of container selection.
+
+    The queue is count-bounded with drop-oldest behavior. Native API/procfs
+    reads happen outside Qt; SQLite persistence remains the consumer's job so a
+    desktop connection never crosses threads.
+    """
+
+    def __init__(
+        self,
+        monitor: NativeHostMonitor | None = None,
+        *,
+        interval_s: float = 1.0,
+        max_queue: int = 3600,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if interval_s <= 0:
+            raise ValueError("interval_s must be positive")
+        if max_queue <= 0:
+            raise ValueError("max_queue must be positive")
+        self.monitor = monitor or NativeHostMonitor()
+        self.interval_s = float(interval_s)
+        self.max_queue = int(max_queue)
+        self.monotonic_clock = monotonic_clock
+        self._items: deque[HostStats] = deque()
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._stop_requested = False
+        self._samples_collected = 0
+        self._failed_samples = 0
+        self._dropped_samples = 0
+        self._last_error: str | None = None
+        self._last_stats: HostStats | None = None
+
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self) -> None:
+        with self._condition:
+            if self.is_running():
+                return
+            self._stop_requested = False
+            self._thread = threading.Thread(
+                target=self._run,
+                name="native-host-runtime",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _append(self, stats: HostStats) -> None:
+        with self._condition:
+            if len(self._items) >= self.max_queue:
+                self._items.popleft()
+                self._dropped_samples += 1
+            self._items.append(stats)
+            self._samples_collected += 1
+            self._last_stats = stats
+            self._last_error = None
+
+    def drain(self, limit: int = 1000) -> tuple[HostStats, ...]:
+        if limit <= 0:
+            return ()
+        result: list[HostStats] = []
+        with self._condition:
+            while self._items and len(result) < limit:
+                result.append(self._items.popleft())
+        return tuple(result)
+
+    def requeue_front(self, samples: tuple[HostStats, ...] | list[HostStats]) -> int:
+        restored = 0
+        with self._condition:
+            for sample in reversed(tuple(samples)):
+                while len(self._items) >= self.max_queue:
+                    self._items.pop()
+                    self._dropped_samples += 1
+                self._items.appendleft(sample)
+                restored += 1
+        return restored
+
+    def snapshot(self) -> HostWorkerSnapshot:
+        with self._condition:
+            return HostWorkerSnapshot(
+                running=self.is_running(),
+                samples_collected=self._samples_collected,
+                failed_samples=self._failed_samples,
+                queued_samples=len(self._items),
+                dropped_samples=self._dropped_samples,
+                last_error=self._last_error,
+                last_stats=self._last_stats,
+            )
+
+    def stop(self, timeout_s: float = 2.0) -> bool:
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(max(0.0, timeout_s))
+        stopped = not thread.is_alive()
+        if stopped:
+            self._thread = None
+        return stopped
+
+    def _run(self) -> None:
+        next_due = float(self.monotonic_clock())
+        while True:
+            with self._condition:
+                if self._stop_requested:
+                    break
+
+            now = float(self.monotonic_clock())
+            if now < next_due:
+                with self._condition:
+                    if self._stop_requested:
+                        break
+                    self._condition.wait(min(next_due - now, 0.25))
+                continue
+
+            stats = self.monitor.get_stats()
+            finished = float(self.monotonic_clock())
+            if stats is None:
+                with self._condition:
+                    self._failed_samples += 1
+                    self._last_error = self.monitor.last_error or "native host collection failed"
+            else:
+                self._append(stats)
+
+            # No catch-up burst after suspend or an unexpectedly slow call.
+            next_due = max(next_due + self.interval_s, finished + self.interval_s)
