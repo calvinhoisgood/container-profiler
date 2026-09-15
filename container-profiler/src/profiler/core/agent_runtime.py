@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import socket
 import threading
 import time
 from typing import Callable
 
 from .agent_forwarding import AgentForwardingRuntime
 from .agent_openmetrics import AgentOpenMetricsWorker
+from .agent_self_metrics import normalize_agent_self_metrics
 from .container_metrics import ContainerMetricsWorker
 from .host_monitor import HostRuntimeWorker
 from .statsd_metrics import StatsDMetricsWorker
@@ -40,6 +42,9 @@ class AgentRuntimeSnapshot:
     container_storage_failures: int = 0
     last_container_storage_error: str | None = None
     containers: object | None = None
+    self_points_persisted: int = 0
+    self_storage_failures: int = 0
+    last_self_storage_error: str | None = None
     forwarding: object | None = None
 
 
@@ -58,13 +63,20 @@ class LocalAgentRuntime:
         retention_s: float = 7 * 24 * 60 * 60,
         retention_max_rows: int = 250_000,
         retention_interval_s: float = 300.0,
+        self_metrics_interval_s: float = 10.0,
+        hostname: Callable[[], str] = socket.gethostname,
         wall_clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if drain_limit <= 0:
             raise ValueError("drain_limit must be positive")
-        if retention_s <= 0 or retention_interval_s <= 0 or retention_max_rows <= 0:
-            raise ValueError("retention settings must be positive")
+        if (
+            retention_s <= 0
+            or retention_interval_s <= 0
+            or retention_max_rows <= 0
+            or self_metrics_interval_s <= 0
+        ):
+            raise ValueError("retention/self-metric settings must be positive")
         self.store = store
         self.host_worker = host_worker or HostRuntimeWorker(interval_s=1, max_queue=3600)
         self.system_worker = system_worker or SystemMetricsRuntimeWorker(
@@ -80,6 +92,8 @@ class LocalAgentRuntime:
         self.retention_s = retention_s
         self.retention_max_rows = retention_max_rows
         self.retention_interval_s = retention_interval_s
+        self.self_metrics_interval_s = float(self_metrics_interval_s)
+        self.hostname = hostname
         self.wall_clock = wall_clock
         self.monotonic_clock = monotonic_clock
         self._running = False
@@ -89,19 +103,23 @@ class LocalAgentRuntime:
         self._statsd_persisted = 0
         self._openmetrics_persisted = 0
         self._container_persisted = 0
+        self._self_persisted = 0
         self._host_storage_failures = 0
         self._system_storage_failures = 0
         self._statsd_storage_failures = 0
         self._openmetrics_storage_failures = 0
         self._container_storage_failures = 0
+        self._self_storage_failures = 0
         self._retention_failures = 0
         self._last_host_storage_error = None
         self._last_system_storage_error = None
         self._last_statsd_storage_error = None
         self._last_openmetrics_storage_error = None
         self._last_container_storage_error = None
+        self._last_self_storage_error = None
         self._last_retention_error = None
         self._next_retention = 0.0
+        self._next_self_metrics = float("inf")
 
     def start(self):
         if self._running:
@@ -132,7 +150,9 @@ class LocalAgentRuntime:
                     pass
             raise
         self._running = True
-        self._next_retention = self.monotonic_clock() + self.retention_interval_s
+        now = self.monotonic_clock()
+        self._next_retention = now + self.retention_interval_s
+        self._next_self_metrics = now + self.self_metrics_interval_s
 
     def _drain_host(self):
         items = self.host_worker.drain(self.drain_limit)
@@ -186,10 +206,29 @@ class LocalAgentRuntime:
             return
 
         self._metric_storage_success(source, written)
-        # Local durability is the source of truth. Remote queue failures are
-        # isolated and must never re-ingest already-persisted local points.
         if self.forwarding_worker:
             self.forwarding_worker.enqueue(items)
+
+    def _emit_self_metrics(self) -> None:
+        now = self.monotonic_clock()
+        if now < self._next_self_metrics:
+            return
+        try:
+            points = normalize_agent_self_metrics(
+                self.snapshot(),
+                timestamp=self.wall_clock(),
+                hostname=str(self.hostname() or "unknown"),
+            )
+            written = self.store.append_custom_metrics(points)
+            self._self_persisted += written
+            self._last_self_storage_error = None
+            if self.forwarding_worker:
+                self.forwarding_worker.enqueue(points)
+        except Exception as exc:
+            self._self_storage_failures += 1
+            self._last_self_storage_error = str(exc)
+        finally:
+            self._next_self_metrics = now + self.self_metrics_interval_s
 
     def _retention(self):
         now = self.monotonic_clock()
@@ -224,6 +263,7 @@ class LocalAgentRuntime:
             self._drain_metrics(self.container_worker, "container")
         self._retention()
         self._ticks += 1
+        self._emit_self_metrics()
 
     def run_forever(self, stop_event: threading.Event, *, poll_interval_s: float = 0.5):
         if poll_interval_s <= 0:
@@ -248,7 +288,6 @@ class LocalAgentRuntime:
             results.append(self.openmetrics_worker.stop(timeout_s=2))
         if self.container_worker:
             results.append(self.container_worker.stop(timeout_s=2))
-        # Stop producers first, then persist/enqueue their final buffered data.
         self.run_once()
         if self.forwarding_worker:
             results.append(self.forwarding_worker.stop(timeout_s=6))
@@ -283,6 +322,9 @@ class LocalAgentRuntime:
             containers=(
                 None if self.container_worker is None else self.container_worker.snapshot()
             ),
+            self_points_persisted=self._self_persisted,
+            self_storage_failures=self._self_storage_failures,
+            last_self_storage_error=self._last_self_storage_error,
             forwarding=(
                 None if self.forwarding_worker is None else self.forwarding_worker.snapshot()
             ),
