@@ -80,6 +80,20 @@ class ContainerLogWorkerTests(unittest.TestCase):
         self.assertEqual(worker.snapshot().duplicate_records, 1)
         self.assertLess(inspector.calls[1][1]["since"], 1_800_000_000)
 
+    def test_identical_lines_in_one_snapshot_are_not_collapsed(self):
+        repeated = ContainerLogLine("2026-09-15T10:00:00Z", "same")
+        inspector = FakeInspector({"a": [[repeated, repeated], [repeated, repeated]]})
+        worker = ContainerLogWorker(
+            monitor=FakeMonitor([info("a")]),
+            inspector_factory=lambda client: inspector,
+        )
+        self.assertTrue(worker.collect_once())
+        first = worker.drain_records(10)
+        self.assertEqual([record.message for record in first], ["same", "same"])
+        self.assertTrue(worker.collect_once())
+        self.assertEqual(worker.drain_records(10), ())
+        self.assertEqual(worker.snapshot().duplicate_records, 2)
+
     def test_failure_isolated_and_container_and_buffer_bounds_visible(self):
         inspector = FakeInspector({
             "a": [[ContainerLogLine("2026-09-15T10:00:00Z", "a")]],

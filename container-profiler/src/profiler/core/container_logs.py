@@ -3,8 +3,8 @@
 Collection deliberately uses bounded snapshot polling rather than one blocking
 thread per container. Docker timestamps form the resume cursor; a small bounded
 identity cache removes the overlap introduced by second-granularity ``since``
-requests. This provides at-least-once collection semantics across transient
-failures without unbounded threads or memory.
+requests. Transient failures are retried from the last timestamped overlap while
+all queues and replay state remain bounded; overload drops are explicitly counted.
 """
 from __future__ import annotations
 
@@ -212,7 +212,7 @@ class ContainerLogWorker:
         self._stop_requested = False
         self._cursors: dict[str, float] = {}
         self._recent: dict[str, deque[tuple[str, str]]] = {}
-        self._recent_sets: dict[str, set[tuple[str, str]]] = {}
+        self._recent_counts: dict[str, dict[tuple[str, str], int]] = {}
         self._collections = 0
         self._discovery_failures = 0
         self._sample_failures = 0
@@ -233,17 +233,25 @@ class ContainerLogWorker:
             self.monitor = self.monitor_factory()
         return self.monitor
 
-    def _is_duplicate(self, container_id: str, timestamp: str, message: str) -> bool:
-        key = (timestamp, message)
-        seen = self._recent_sets.setdefault(container_id, set())
-        if key in seen:
-            return True
+    def _remember_timestamped(self, container_id: str, key: tuple[str, str]) -> None:
+        """Remember accepted log identities with bounded multiset semantics.
+
+        A multiset matters here: two legitimate identical writes can share the
+        same timestamp/message. Future overlapping Docker snapshots should drop
+        only as many copies as were observed previously, not collapse duplicates
+        within the current response.
+        """
         queue = self._recent.setdefault(container_id, deque())
+        counts = self._recent_counts.setdefault(container_id, {})
         while len(queue) >= self.dedupe_entries_per_container:
-            seen.discard(queue.popleft())
+            old = queue.popleft()
+            remaining = counts.get(old, 0) - 1
+            if remaining > 0:
+                counts[old] = remaining
+            else:
+                counts.pop(old, None)
         queue.append(key)
-        seen.add(key)
-        return False
+        counts[key] = counts.get(key, 0) + 1
 
     def collect_once(self) -> bool:
         try:
@@ -309,14 +317,25 @@ class ContainerLogWorker:
                 continue
 
             newest = cursor
+            # Snapshot only history from prior polls. Accepted duplicates inside
+            # this response are remembered after the duplicate decision and are
+            # therefore preserved as distinct log writes.
+            overlap_counts = dict(self._recent_counts.get(container_id, {}))
             for line in lines:
                 docker_timestamp = getattr(line, "timestamp", None)
                 message = str(getattr(line, "message", ""))
                 epoch = _timestamp_epoch(docker_timestamp)
                 if docker_timestamp and epoch is not None:
-                    if self._is_duplicate(container_id, docker_timestamp, message):
+                    key = (docker_timestamp, message)
+                    remaining = overlap_counts.get(key, 0)
+                    if remaining > 0:
                         duplicates += 1
+                        if remaining == 1:
+                            overlap_counts.pop(key, None)
+                        else:
+                            overlap_counts[key] = remaining - 1
                         continue
+                    self._remember_timestamped(container_id, key)
                     newest = epoch if newest is None else max(newest, epoch)
                     timestamp = epoch
                 else:
@@ -335,10 +354,12 @@ class ContainerLogWorker:
             if newest is not None:
                 self._cursors[container_id] = newest
 
+        # A successful discovery is authoritative: forgotten containers cannot
+        # grow cursor/dedupe state forever. A failed discovery returns earlier.
         for stale in set(self._cursors) - active_ids:
             self._cursors.pop(stale, None)
             self._recent.pop(stale, None)
-            self._recent_sets.pop(stale, None)
+            self._recent_counts.pop(stale, None)
 
         accepted = self.buffer.append_many(accepted_records)
         with self._condition:
