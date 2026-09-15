@@ -36,6 +36,7 @@ def build_parser():
     p.add_argument("--heartbeat-interval", type=float, default=5.0)
     p.add_argument("--status", action="store_true")
     p.add_argument("--status-max-age", type=float, default=15.0)
+    p.add_argument("--self-metrics-interval", type=float, default=10.0)
     p.add_argument("--container-interval", type=float, default=2.0)
     p.add_argument("--container-max", type=int, default=256)
     p.add_argument(
@@ -127,7 +128,8 @@ def _print_status(path, max_age_s):
         f"system_points={r.get('system_points_persisted', '-')} "
         f"container_points={r.get('container_points_persisted', '-')} "
         f"dogstatsd_points={r.get('statsd_points_persisted', '-')} "
-        f"openmetrics_points={r.get('openmetrics_points_persisted', '-')}"
+        f"openmetrics_points={r.get('openmetrics_points_persisted', '-')} "
+        f"self_points={r.get('self_points_persisted', '-')}"
     )
     for key in (
         "last_host_storage_error",
@@ -135,6 +137,7 @@ def _print_status(path, max_age_s):
         "last_container_storage_error",
         "last_statsd_storage_error",
         "last_openmetrics_storage_error",
+        "last_self_storage_error",
         "last_retention_error",
     ):
         if r.get(key):
@@ -197,6 +200,7 @@ def _runtime_for(store, args):
         openmetrics_worker=openmetrics,
         container_worker=containers,
         forwarding_worker=forwarding,
+        self_metrics_interval_s=args.self_metrics_interval,
     )
 
 
@@ -280,13 +284,14 @@ def _run_agent(args):
     if snapshot is not None:
         log.info(
             "agent stopped; ticks=%d host_samples=%d system_points=%d "
-            "container_points=%d dogstatsd_points=%d openmetrics_points=%d",
+            "container_points=%d dogstatsd_points=%d openmetrics_points=%d self_points=%d",
             snapshot.ticks,
             snapshot.host_samples_persisted,
             snapshot.system_points_persisted,
             snapshot.container_points_persisted,
             snapshot.statsd_points_persisted,
             snapshot.openmetrics_points_persisted,
+            snapshot.self_points_persisted,
         )
     return 0
 
@@ -298,6 +303,7 @@ def main(argv=None):
         args.poll_interval <= 0
         or args.heartbeat_interval <= 0
         or args.status_max_age <= 0
+        or args.self_metrics_interval <= 0
         or args.container_interval <= 0
         or args.dogstatsd_flush_interval <= 0
         or args.openmetrics_discovery_interval <= 0
