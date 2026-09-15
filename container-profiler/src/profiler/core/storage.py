@@ -1,4 +1,4 @@
-"""Durable local telemetry and alert store backed by SQLite.
+"""Durable local telemetry, alert, and custom-metric store backed by SQLite.
 
 The store is intentionally independent from Qt and Docker so it can be used by
 future agent/service and GUI processes. WAL mode allows a writer and explorers
@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .alerting import AlertEvent
+from .custom_metrics import CustomMetricPoint
 
 
 class SQLiteTelemetryStore:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
@@ -98,6 +99,26 @@ class SQLiteTelemetryStore:
                 ON alert_events(current_status, severity, rule_name);
             CREATE INDEX IF NOT EXISTS idx_alert_events_session
                 ON alert_events(session_id, timestamp DESC);
+            CREATE TABLE IF NOT EXISTS custom_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                name TEXT NOT NULL,
+                value REAL NOT NULL,
+                metric_type TEXT,
+                unit TEXT,
+                source TEXT NOT NULL,
+                target_key TEXT,
+                container_id TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS idx_custom_metrics_timestamp
+                ON custom_metrics(timestamp DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_custom_metrics_name_timestamp
+                ON custom_metrics(name, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_custom_metrics_container_timestamp
+                ON custom_metrics(container_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_custom_metrics_target_timestamp
+                ON custom_metrics(target_key, timestamp DESC);
             """
         )
         self._db.execute(
@@ -306,6 +327,141 @@ class SQLiteTelemetryStore:
                 (when, acknowledged_by, note, int(event_id)),
             )
         return cursor.rowcount == 1
+
+    def append_custom_metrics(self, points: Iterable[CustomMetricPoint]) -> int:
+        """Persist one bounded batch of normalized custom metric points."""
+        rows = []
+        for point in points:
+            rows.append(
+                (
+                    float(point.timestamp),
+                    point.name,
+                    float(point.value),
+                    point.metric_type,
+                    point.unit,
+                    point.source,
+                    point.target_key,
+                    point.container_id,
+                    json.dumps(point.tags, ensure_ascii=False, separators=(",", ":")),
+                )
+            )
+        if not rows:
+            return 0
+        with self._db:
+            self._db.executemany(
+                """
+                INSERT INTO custom_metrics(
+                    timestamp, name, value, metric_type, unit, source,
+                    target_key, container_id, tags_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def query_custom_metrics(
+        self,
+        *,
+        name: str | None = None,
+        name_prefix: str | None = None,
+        container_id: str | None = None,
+        target_key: str | None = None,
+        source: str | None = None,
+        start_timestamp: float | None = None,
+        end_timestamp: float | None = None,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        """Return newest custom points matching indexed, bounded filters."""
+        if limit <= 0:
+            return []
+        if limit > 10_000:
+            limit = 10_000
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("name", name),
+            ("container_id", container_id),
+            ("target_key", target_key),
+            ("source", source),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        if name_prefix is not None:
+            # Escape SQL LIKE metacharacters so this remains a prefix filter,
+            # not an accidental wildcard query controlled by UI text.
+            escaped = name_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("name LIKE ? ESCAPE '\\'")
+            params.append(escaped + "%")
+        if start_timestamp is not None:
+            clauses.append("timestamp>=?")
+            params.append(float(start_timestamp))
+        if end_timestamp is not None:
+            clauses.append("timestamp<=?")
+            params.append(float(end_timestamp))
+        where = "" if not clauses else "WHERE " + " AND ".join(clauses)
+        params.append(int(limit))
+        rows = self._db.execute(
+            "SELECT id, timestamp, name, value, metric_type, unit, source, "
+            f"target_key, container_id, tags_json FROM custom_metrics {where} "
+            "ORDER BY timestamp DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["tags"] = tuple(json.loads(item.pop("tags_json")))
+            except (TypeError, ValueError):
+                item["tags"] = ()
+            result.append(item)
+        return result
+
+    def list_custom_metric_names(
+        self,
+        *,
+        prefix: str = "",
+        limit: int = 200,
+    ) -> list[str]:
+        if limit <= 0:
+            return []
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self._db.execute(
+            "SELECT DISTINCT name FROM custom_metrics "
+            "WHERE name LIKE ? ESCAPE '\\' ORDER BY name ASC LIMIT ?",
+            (escaped + "%", min(int(limit), 1000)),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def prune_custom_metrics(
+        self,
+        *,
+        before_timestamp: float | None = None,
+        max_rows: int | None = None,
+    ) -> int:
+        """Apply age and row-count retention, returning deleted row count."""
+        if max_rows is not None and max_rows < 0:
+            raise ValueError("max_rows must be >= 0")
+        deleted = 0
+        with self._db:
+            if before_timestamp is not None:
+                cursor = self._db.execute(
+                    "DELETE FROM custom_metrics WHERE timestamp<?",
+                    (float(before_timestamp),),
+                )
+                deleted += cursor.rowcount
+            if max_rows is not None:
+                count = int(self._db.execute("SELECT COUNT(*) FROM custom_metrics").fetchone()[0])
+                excess = max(0, count - int(max_rows))
+                if excess:
+                    cursor = self._db.execute(
+                        "DELETE FROM custom_metrics WHERE id IN ("
+                        "SELECT id FROM custom_metrics ORDER BY timestamp ASC, id ASC LIMIT ?"
+                        ")",
+                        (excess,),
+                    )
+                    deleted += cursor.rowcount
+        return deleted
 
     def delete_session(self, session_id: str) -> bool:
         with self._db:
