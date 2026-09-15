@@ -24,5 +24,8 @@ jobs:
       - name: Headless agent import smoke
         working-directory: container-profiler
         run: python agent.py --help
+      - name: Windows service host import smoke
+        working-directory: container-profiler
+        run: python agent_service.py --help
       - name: Compile sources and entry points
-        run: python -m compileall -q container-profiler/src && python -m py_compile container-profiler/agent.py container-profiler/main.py
+        run: python -m compileall -q container-profiler/src && python -m py_compile container-profiler/agent.py container-profiler/agent_service.py container-profiler/main.py
