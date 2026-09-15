@@ -18,6 +18,19 @@ from .storage import SQLiteTelemetryStore
 from .system_metrics import SystemMetricsRuntimeWorker
 
 
+def _worker_snapshot(worker):
+    """Best-effort worker health snapshot that cannot break Agent status emission."""
+    if worker is None:
+        return None
+    snapshot = getattr(worker, "snapshot", None)
+    if not callable(snapshot):
+        return None
+    try:
+        return snapshot()
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRuntimeSnapshot:
     running: bool
@@ -30,6 +43,8 @@ class AgentRuntimeSnapshot:
     last_host_storage_error: str | None
     last_system_storage_error: str | None
     last_retention_error: str | None
+    host: object | None = None
+    system: object | None = None
     statsd_points_persisted: int = 0
     statsd_storage_failures: int = 0
     last_statsd_storage_error: str | None = None
@@ -306,6 +321,8 @@ class LocalAgentRuntime:
             last_host_storage_error=self._last_host_storage_error,
             last_system_storage_error=self._last_system_storage_error,
             last_retention_error=self._last_retention_error,
+            host=_worker_snapshot(self.host_worker),
+            system=_worker_snapshot(self.system_worker),
             statsd_points_persisted=self._statsd_persisted,
             statsd_storage_failures=self._statsd_storage_failures,
             last_statsd_storage_error=self._last_statsd_storage_error,
