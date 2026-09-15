@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import agent_service
 from profiler.core.agent_forwarding import AgentForwardingRuntime
 from profiler.core.agent_openmetrics import AgentOpenMetricsWorker
+from profiler.core.container_logs import ContainerLogWorker
 from profiler.core.container_metrics import ContainerMetricsWorker
 from profiler.core.statsd_metrics import StatsDMetricsWorker
 
@@ -31,6 +32,16 @@ class AgentServiceCLITests(unittest.TestCase):
         self.assertEqual(command, expected)
         self.assertIn('"C:\\Program Data\\Container Profiler\\telemetry.sqlite3"', command)
 
+    def test_container_logs_require_explicit_persistent_service_opt_in(self):
+        database = Path(r"C:\Program Data\Container Profiler\telemetry.sqlite3")
+        command = agent_service.build_service_binary_command(database, container_logs=True)
+        self.assertIn("--container-logs", command)
+        default_kwargs = agent_service._service_runtime_kwargs()
+        opted_in = agent_service._service_runtime_kwargs(container_logs=True)
+        self.assertNotIn("log_worker", default_kwargs)
+        self.assertIsInstance(opted_in["log_worker"], ContainerLogWorker)
+        self.assertIsNone(opted_in["log_worker"].monitor)
+
     def test_service_composes_full_headless_agent_without_starting_hardware(self):
         kwargs = agent_service._service_runtime_kwargs()
         self.assertIsInstance(kwargs["container_worker"], ContainerMetricsWorker)
@@ -47,7 +58,7 @@ class AgentServiceCLITests(unittest.TestCase):
         host = mock.Mock()
         host.run.return_value = 0
         with mock.patch.object(agent_service, "_windows_required", return_value=True), mock.patch.object(
-            agent_service, "LocalAgentProcess", return_value=process
+            agent_service, "LogAwareAgentProcess", return_value=process
         ) as local_process, mock.patch.object(
             agent_service, "WindowsServiceHost", return_value=host
         ):
@@ -58,6 +69,20 @@ class AgentServiceCLITests(unittest.TestCase):
         self.assertIn("statsd_worker", kwargs)
         self.assertIn("openmetrics_worker", kwargs)
         self.assertIn("forwarding_worker", kwargs)
+        self.assertNotIn("log_worker", kwargs)
+
+    def test_run_service_adds_logs_only_after_opt_in(self):
+        process = mock.Mock()
+        host = mock.Mock()
+        host.run.return_value = 0
+        with mock.patch.object(agent_service, "_windows_required", return_value=True), mock.patch.object(
+            agent_service, "LogAwareAgentProcess", return_value=process
+        ) as local_process, mock.patch.object(
+            agent_service, "WindowsServiceHost", return_value=host
+        ):
+            result = agent_service._run_service(Path("telemetry.sqlite3"), container_logs=True)
+        self.assertEqual(result, 0)
+        self.assertIsInstance(local_process.call_args.kwargs["log_worker"], ContainerLogWorker)
 
     def test_install_refuses_machine_change_without_explicit_confirmation(self):
         with mock.patch.object(agent_service, "_windows_required", return_value=True), mock.patch.object(
@@ -84,6 +109,17 @@ class AgentServiceCLITests(unittest.TestCase):
         self.assertIn("start=", calls[0])
         self.assertIn("auto", calls[0])
         self.assertEqual(calls[1][0:2], ("description", agent_service.SERVICE_NAME))
+
+    def test_install_persists_log_opt_in_in_scm_command(self):
+        calls = []
+        with mock.patch.object(agent_service, "_windows_required", return_value=True), mock.patch.object(
+            agent_service, "_run_sc", side_effect=lambda *args: calls.append(args) or 0
+        ):
+            result = agent_service._install(
+                Path("telemetry.sqlite3"), confirmed=True, container_logs=True
+            )
+        self.assertEqual(result, 0)
+        self.assertIn("--container-logs", " ".join(calls[0]))
 
     def test_uninstall_also_requires_explicit_confirmation(self):
         with mock.patch.object(agent_service, "_windows_required", return_value=True), mock.patch.object(
