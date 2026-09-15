@@ -13,12 +13,18 @@ from pathlib import Path
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from profiler.core.agent_forwarding import AgentForwardingRuntime
 from profiler.core.agent_openmetrics import AgentOpenMetricsWorker
 from profiler.core.agent_runtime import LocalAgentRuntime
 from profiler.core.agent_status import read_agent_status, write_agent_status
 from profiler.core.statsd_metrics import StatsDMetricsWorker
 from profiler.core.storage import SQLiteTelemetryStore
-from profiler.utils.paths import get_agent_status_path, get_telemetry_db_path
+from profiler.utils.paths import (
+    get_agent_status_path,
+    get_forwarding_config_path,
+    get_forwarding_db_path,
+    get_telemetry_db_path,
+)
 
 
 def build_parser():
@@ -51,6 +57,24 @@ def build_parser():
         "--no-openmetrics",
         action="store_true",
         help="Disable Docker label based OpenMetrics/Prometheus Autodiscovery",
+    )
+    p.add_argument(
+        "--forwarding-config",
+        type=Path,
+        default=get_forwarding_config_path(),
+        help="Disabled-by-default remote forwarding JSON configuration",
+    )
+    p.add_argument(
+        "--forwarding-spool",
+        type=Path,
+        default=get_forwarding_db_path(),
+        help="Durable bounded outbound forwarding spool",
+    )
+    p.add_argument("--forwarding-reload-interval", type=float, default=2.0)
+    p.add_argument(
+        "--no-forwarding",
+        action="store_true",
+        help="Disable forwarding runtime even if its configuration enables it",
     )
     p.add_argument(
         "--log-level",
@@ -111,6 +135,17 @@ def _print_status(path, max_age_s):
             print(f"openmetrics_docker_error={openmetrics['last_docker_error']}")
         if openmetrics.get("last_sync_error"):
             print(f"openmetrics_sync_error={openmetrics['last_sync_error']}")
+    forwarding = r.get("forwarding")
+    if isinstance(forwarding, dict):
+        queue = forwarding.get("queue") or {}
+        print(
+            "forwarding="
+            + ("enabled" if forwarding.get("enabled") else "disabled")
+            + f" queued={queue.get('queued_items', 0)} dropped={queue.get('dropped_items', 0)}"
+        )
+        for key in ("last_config_error", "last_enqueue_error", "last_runtime_error"):
+            if forwarding.get(key):
+                print(f"forwarding_{key}={forwarding[key]}")
     return 0 if view.state == "running" and not view.stale else 3
 
 
@@ -127,10 +162,18 @@ def _runtime_for(store, args):
         openmetrics = AgentOpenMetricsWorker(
             discovery_interval_s=args.openmetrics_discovery_interval
         )
+    forwarding = None
+    if not args.no_forwarding:
+        forwarding = AgentForwardingRuntime(
+            Path(args.forwarding_config).expanduser(),
+            Path(args.forwarding_spool).expanduser(),
+            reload_interval_s=args.forwarding_reload_interval,
+        )
     return LocalAgentRuntime(
         store,
         statsd_worker=statsd,
         openmetrics_worker=openmetrics,
+        forwarding_worker=forwarding,
     )
 
 
@@ -145,7 +188,7 @@ def _run_agent(args):
     runtime = None
     snapshot = None
     log.info(
-        "starting headless agent; database=%s dogstatsd=%s openmetrics=%s",
+        "starting headless agent; database=%s dogstatsd=%s openmetrics=%s forwarding=%s",
         database,
         "disabled"
         if args.no_dogstatsd
@@ -153,6 +196,7 @@ def _run_agent(args):
         "disabled"
         if args.no_openmetrics
         else f"docker-autodiscovery/{args.openmetrics_discovery_interval:g}s",
+        "disabled" if args.no_forwarding else str(args.forwarding_config),
     )
     try:
         with SQLiteTelemetryStore(database) as store:
@@ -231,6 +275,7 @@ def main(argv=None):
         or args.status_max_age <= 0
         or args.dogstatsd_flush_interval <= 0
         or args.openmetrics_discovery_interval <= 0
+        or args.forwarding_reload_interval <= 0
     ):
         p.error("intervals must be positive")
     if not 0 <= args.dogstatsd_port <= 65535:

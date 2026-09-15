@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Callable
 
+from .agent_forwarding import AgentForwardingRuntime
 from .agent_openmetrics import AgentOpenMetricsWorker
 from .host_monitor import HostRuntimeWorker
 from .statsd_metrics import StatsDMetricsWorker
@@ -34,6 +35,7 @@ class AgentRuntimeSnapshot:
     openmetrics_storage_failures: int = 0
     last_openmetrics_storage_error: str | None = None
     openmetrics: object | None = None
+    forwarding: object | None = None
 
 
 class LocalAgentRuntime:
@@ -45,6 +47,7 @@ class LocalAgentRuntime:
         system_worker: SystemMetricsRuntimeWorker | None = None,
         statsd_worker: StatsDMetricsWorker | None = None,
         openmetrics_worker: AgentOpenMetricsWorker | None = None,
+        forwarding_worker: AgentForwardingRuntime | None = None,
         drain_limit: int = 1000,
         retention_s: float = 7 * 24 * 60 * 60,
         retention_max_rows: int = 250_000,
@@ -65,6 +68,7 @@ class LocalAgentRuntime:
         )
         self.statsd_worker = statsd_worker
         self.openmetrics_worker = openmetrics_worker
+        self.forwarding_worker = forwarding_worker
         self.drain_limit = drain_limit
         self.retention_s = retention_s
         self.retention_max_rows = retention_max_rows
@@ -92,6 +96,10 @@ class LocalAgentRuntime:
     def start(self):
         if self._running:
             return
+        forwarding_started = False
+        if self.forwarding_worker:
+            self.forwarding_worker.start()
+            forwarding_started = True
         self.host_worker.start()
         system_started = False
         statsd_started = False
@@ -113,6 +121,8 @@ class LocalAgentRuntime:
             if system_started:
                 self.system_worker.stop(timeout_s=2)
             self.host_worker.stop(timeout_s=2)
+            if forwarding_started and self.forwarding_worker:
+                self.forwarding_worker.stop(timeout_s=6)
             raise
         self._running = True
         self._next_retention = self.monotonic_clock() + self.retention_interval_s
@@ -147,6 +157,7 @@ class LocalAgentRuntime:
                 self._openmetrics_storage_failures += 1
                 self._last_openmetrics_storage_error = str(exc)
             return
+
         if source == "system":
             self._system_persisted += written
             self._last_system_storage_error = None
@@ -156,6 +167,11 @@ class LocalAgentRuntime:
         else:
             self._openmetrics_persisted += written
             self._last_openmetrics_storage_error = None
+
+        # Local durability is the source of truth. Remote queue failures are
+        # isolated and must never re-ingest already-persisted local points.
+        if self.forwarding_worker:
+            self.forwarding_worker.enqueue(items)
 
     def _retention(self):
         now = self.monotonic_clock()
@@ -178,6 +194,8 @@ class LocalAgentRuntime:
             self._next_retention = now + self.retention_interval_s
 
     def run_once(self):
+        if self.forwarding_worker:
+            self.forwarding_worker.tick()
         self._drain_host()
         self._drain_metrics(self.system_worker, "system")
         if self.statsd_worker:
@@ -208,9 +226,19 @@ class LocalAgentRuntime:
             statsd_stopped = self.statsd_worker.stop(timeout_s=2)
         if self.openmetrics_worker:
             openmetrics_stopped = self.openmetrics_worker.stop(timeout_s=2)
+        # Stop producers first, then persist/enqueue their final buffered data.
         self.run_once()
+        forwarding_stopped = True
+        if self.forwarding_worker:
+            forwarding_stopped = self.forwarding_worker.stop(timeout_s=6)
         self._running = False
-        return bool(host_stopped and system_stopped and statsd_stopped and openmetrics_stopped)
+        return bool(
+            host_stopped
+            and system_stopped
+            and statsd_stopped
+            and openmetrics_stopped
+            and forwarding_stopped
+        )
 
     def snapshot(self):
         return AgentRuntimeSnapshot(
@@ -233,6 +261,9 @@ class LocalAgentRuntime:
             last_openmetrics_storage_error=self._last_openmetrics_storage_error,
             openmetrics=(
                 None if self.openmetrics_worker is None else self.openmetrics_worker.snapshot()
+            ),
+            forwarding=(
+                None if self.forwarding_worker is None else self.forwarding_worker.snapshot()
             ),
         )
 
