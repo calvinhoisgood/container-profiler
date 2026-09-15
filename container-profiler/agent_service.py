@@ -16,9 +16,17 @@ import sys
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from profiler.core.agent_forwarding import AgentForwardingRuntime
+from profiler.core.agent_openmetrics import AgentOpenMetricsWorker
 from profiler.core.agent_runtime import LocalAgentProcess
+from profiler.core.container_metrics import ContainerMetricsWorker
+from profiler.core.statsd_metrics import StatsDMetricsWorker
 from profiler.core.windows_service import WindowsServiceHost
-from profiler.utils.paths import get_telemetry_db_path
+from profiler.utils.paths import (
+    get_forwarding_config_path,
+    get_forwarding_db_path,
+    get_telemetry_db_path,
+)
 
 SERVICE_NAME = "ContainerProfilerAgent"
 DISPLAY_NAME = "Container Profiler Agent"
@@ -65,9 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("start", help="Start the installed service")
     sub.add_parser("stop", help="Request the installed service to stop")
     sub.add_parser("query", help="Query current SCM service status")
-    sub.add_parser("print-install-command", help="Print the service binPath without changing the machine").add_argument(
-        "--database", type=Path, default=get_telemetry_db_path()
-    )
+    sub.add_parser(
+        "print-install-command", help="Print the service binPath without changing the machine"
+    ).add_argument("--database", type=Path, default=get_telemetry_db_path())
     return parser
 
 
@@ -92,10 +100,32 @@ def _run_sc(*args: str) -> int:
     return int(completed.returncode)
 
 
+def _service_runtime_kwargs() -> dict:
+    """Compose the same default headless collectors used by the console Agent.
+
+    Construction is hardware-safe: Docker clients remain lazy and the UDP
+    socket/forwarder are not started until the service runtime starts.
+    """
+    return {
+        "container_worker": ContainerMetricsWorker(interval_s=2.0, max_containers=256),
+        "statsd_worker": StatsDMetricsWorker(
+            host="127.0.0.1",
+            port=8125,
+            flush_interval_s=10.0,
+        ),
+        "openmetrics_worker": AgentOpenMetricsWorker(discovery_interval_s=10.0),
+        "forwarding_worker": AgentForwardingRuntime(
+            get_forwarding_config_path(),
+            get_forwarding_db_path(),
+            reload_interval_s=2.0,
+        ),
+    }
+
+
 def _run_service(database: Path) -> int:
     if not _windows_required():
         return 2
-    process = LocalAgentProcess(database.expanduser())
+    process = LocalAgentProcess(database.expanduser(), **_service_runtime_kwargs())
     host = WindowsServiceHost(SERVICE_NAME, process.run)
     return host.run()
 
