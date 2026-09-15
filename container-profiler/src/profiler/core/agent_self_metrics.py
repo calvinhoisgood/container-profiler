@@ -81,6 +81,14 @@ def normalize_agent_self_metrics(
         "container_profiler.alert.failures",
         _get(snapshot, "alert_failures", default=0),
     )
+    add(
+        "container_profiler.alert.audit_queue",
+        _get(snapshot, "alert_events_queued", default=0),
+    )
+    add(
+        "container_profiler.alert.audit_dropped",
+        _get(snapshot, "alert_events_dropped", default=0),
+    )
 
     host_runtime = _get(snapshot, "host")
     if host_runtime is not None:
