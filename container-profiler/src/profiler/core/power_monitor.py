@@ -1,4 +1,10 @@
-"""Optional host power sensors: HWiNFO shared memory and NVIDIA NVML."""
+"""Optional power sensors.
+
+NVIDIA metrics use the vendor NVML interface directly. HWiNFO shared memory is
+kept only as an opt-in compatibility provider for CPU package power; the core
+agent no longer attempts to connect to third-party monitoring software by
+default.
+"""
 from __future__ import annotations
 
 import ctypes
@@ -12,8 +18,9 @@ from .models import PowerStats
 class HWiNFOReader:
     """Read CPU Package Power from HWiNFO's Windows shared memory.
 
-    The class is intentionally import-safe on non-Windows platforms. That makes
-    unit testing and documentation builds possible without hiding platform bugs.
+    This is a compatibility backend, not a core dependency. It is import-safe
+    on non-Windows platforms and is instantiated by ``PowerMonitor`` only when
+    explicitly enabled.
     """
 
     SHARED_MEMORY_NAME = r"Global\HWiNFO_SENS_SM2"
@@ -134,8 +141,23 @@ class HWiNFOReader:
         self._mapping = None
 
 
+class DisabledCPUPowerReader:
+    """No-op CPU-power provider used by the self-contained default runtime."""
+
+    last_error = "CPU package power compatibility provider is disabled"
+
+    def is_connected(self) -> bool:
+        return False
+
+    def get_cpu_power(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 class NVMLReader:
-    """NVIDIA GPU metrics with injectable NVML module for deterministic tests."""
+    """NVIDIA GPU metrics with injectable official NVML binding."""
 
     def __init__(self, module: Any | None = None) -> None:
         self.pynvml: Any | None = None
@@ -147,6 +169,7 @@ class NVMLReader:
     def _init(self, module: Any | None) -> None:
         try:
             if module is None:
+                # nvidia-ml-py exposes the vendor API through this import name.
                 import pynvml as module
             module.nvmlInit()
             self.pynvml = module
@@ -198,15 +221,28 @@ class NVMLReader:
 
 
 class PowerMonitor:
-    """Unified facade for optional CPU/GPU power sources."""
+    """Facade for optional power/GPU sources.
+
+    HWiNFO is disabled by default. Set ``enable_hwinfo=True`` (or the
+    ``CONTAINER_PROFILER_ENABLE_HWINFO=1`` environment variable) if the user
+    explicitly wants the compatibility CPU package-power source.
+    """
 
     def __init__(
         self,
         *,
-        hwinfo: HWiNFOReader | None = None,
+        hwinfo: Any | None = None,
         nvml: NVMLReader | None = None,
+        enable_hwinfo: bool | None = None,
     ) -> None:
-        self.hwinfo = hwinfo if hwinfo is not None else HWiNFOReader()
+        if hwinfo is not None:
+            self.hwinfo = hwinfo
+        else:
+            if enable_hwinfo is None:
+                enable_hwinfo = os.environ.get("CONTAINER_PROFILER_ENABLE_HWINFO", "").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }
+            self.hwinfo = HWiNFOReader() if enable_hwinfo else DisabledCPUPowerReader()
         self.nvml = nvml if nvml is not None else NVMLReader()
 
     def get_power_stats(self) -> PowerStats:
