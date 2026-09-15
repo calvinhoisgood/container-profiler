@@ -1,5 +1,20 @@
 # 開發日誌
 
+## 2026-09-15
+### 17:17 - Headless Agent lifecycle、bounded ingestion 與可靠傳輸整合
+- **類型**: 架構 / 功能 / 可靠性 / 測試
+- **分支**: `gpt56-rebuild-v5`
+- **狀態**: ✅ hardware-free GitHub Actions 驗證持續通過
+- **備註**:
+    1. **OpenMetrics Agent 化**: Docker label Autodiscovery 與 scrape worker 移入 headless Agent lifecycle；Docker discovery 暫時失敗時保留 last-known-good targets，成功空掃描才清除 target set。
+    2. **DogStatsD resource governance**: 對 series、packet line、metric/tag 長度、tag 數、histogram observations、set cardinality 加入顯式上限及 cumulative drop accounting，避免 UDP sender 造成無界記憶體增長。
+    3. **Durable forwarding**: 已有 SQLite outbound queue / HTTP retry path 正式接入 headless Agent；forwarding 預設停用，支援 config hot reload、last-known-good config、bounded disk spool 與 runtime health snapshot。本機 SQLite persistence 成功後才 enqueue 遠端 spool，避免遠端失敗污染本機 persistence retry 語義。
+    4. **All-container telemetry**: 新增 headless Docker container metrics worker，背景收集所有 running containers 的 CPU、memory、network bytes/rates、PID count，具有 max-container / point / byte bounds 與 per-container failure isolation。
+    5. **Windows Service parity**: Windows Service host 現在組合與 console Agent 相同的 container / DogStatsD / OpenMetrics / forwarding 預設 runtime，避免 service mode 靜默缺少新能力。
+    6. **Agent self-observability**: 將 persistence failures、DogStatsD drops、OpenMetrics discovery、container collector errors、forwarding queue/backoff health 轉成 `source=agent` custom metrics，週期性持久化並可選擇 forwarding；CLI status 同時顯示 self-metric progress/error。
+    7. **驗證範圍**: GitHub Actions 已連續驗證 Windows/Linux × Python 3.11/3.13 的 hardware-free unit tests、`agent.py --help`、Windows Service host import smoke 及 compile checks。此環境沒有宣稱測過真實 Docker Desktop/daemon、Windows SCM service install/run、HWiNFO shared memory、NVIDIA driver/GPU 或其他實體硬件。
+    8. **剩餘差距**: process/log/alert 的完整 headless lifecycle、shared Docker discovery/cache、collector/plugin lifecycle、一般化 config hot reload、transactional forwarding reconciliation、Explorer UX、installer/upgrade/release/performance/security 與真機 soak tests 仍需繼續。
+
 ## 2026-01-27
 ### 11:30 - 初始化項目
 - **類型**: 創建
@@ -62,7 +77,7 @@
 - **備註**: 
     1. **代碼修復**: 重寫 `main.py` 修復了文件編碼導致的路徑設置無效問題。
     2. **模塊丟失修復**: 在 `build.spec` 中使用 `datas` 強制包含 `profiler` 源碼包，解決 `ModuleNotFoundError: No module named 'profiler'`。
-    3. **依賴補全**: 在 `hiddenimports` 中顯式添加 `docker`, `pynvml`, `construct` 等第三方庫，解決運行時依賴缺失。
+    3. **依賴補全**: 在 `hiddenimports` 中顯式添加 `docker`, `pynvml`, `construct` 等第三方庫，解決運行時依賴丟失。
     4. **文件鎖定規避**: 輸出文件重命名為 `ContainerProfiler_v2.exe` 以避開系統對舊文件的鎖定。
     5. **最終產物**: `dist/ContainerProfiler_v2.exe` (已包含完整依賴)。
 

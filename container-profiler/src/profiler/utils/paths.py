@@ -1,30 +1,56 @@
-"""
-路徑處理工具 - 兼容開發環境和打包後環境
-"""
+"""Path helpers for source and frozen application environments."""
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
+
 def get_base_path() -> Path:
-    """獲取項目根目錄"""
-    if getattr(sys, 'frozen', False):
-        # 打包後: exe 所在目錄
+    """Return the application base directory."""
+    if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
-    else:
-        # 開發時: main.py 所在目錄
-        return Path(__file__).parent.parent.parent.parent
+    return Path(__file__).parent.parent.parent.parent
+
 
 def get_resource_path(relative_path: str) -> Path:
-    """獲取資源文件路徑"""
+    """Resolve a bundled/static resource path."""
     return get_base_path() / relative_path
 
+
 def get_config_dir() -> Path:
-    """獲取配置文件目錄 (用戶目錄)"""
+    """Return the user-writable application state directory."""
     config_dir = Path.home() / ".container-profiler"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 
+
 def get_output_dir() -> Path:
-    """獲取輸出目錄"""
+    """Return the default export directory."""
     output_dir = get_config_dir() / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def get_telemetry_db_path() -> Path:
+    """Return the durable local telemetry database path."""
+    return get_config_dir() / "telemetry.sqlite3"
+
+
+def get_agent_status_path() -> Path:
+    """Return the atomic headless-agent heartbeat/status path."""
+    return get_config_dir() / "agent-status.json"
+
+
+def get_alert_config_path() -> Path:
+    """Return the per-user JSON threshold-alert configuration path."""
+    return get_config_dir() / "alerts.json"
+
+
+def get_forwarding_config_path() -> Path:
+    """Return the disabled-by-default remote forwarding configuration path."""
+    return get_config_dir() / "forwarding.json"
+
+
+def get_forwarding_db_path() -> Path:
+    """Return the durable bounded outbound spool path."""
+    return get_config_dir() / "forwarding.sqlite3"

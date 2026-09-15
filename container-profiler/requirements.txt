@@ -1,6 +1,5 @@
 PyQt6
 pyqtgraph
 docker
-pynvml
-construct
+nvidia-ml-py
 pyinstaller

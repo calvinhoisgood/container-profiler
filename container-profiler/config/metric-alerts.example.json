@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "name": "host-process-count-high",
+      "metric": "container_profiler.host.processes",
+      "operator": "gt",
+      "threshold": 1000,
+      "trigger_for_s": 60,
+      "recovery_threshold": 900,
+      "severity": "warning",
+      "enabled": false
+    },
+    {
+      "name": "system-buffer-dropping",
+      "metric": "container_profiler.system.buffer_dropped_points",
+      "operator": "gt",
+      "threshold": 0,
+      "trigger_for_s": 30,
+      "recovery_threshold": 0,
+      "severity": "critical",
+      "enabled": false
+    }
+  ]
+}

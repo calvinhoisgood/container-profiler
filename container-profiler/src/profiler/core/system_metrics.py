@@ -1,0 +1,495 @@
+"""Normalize native host checks into Datadog-compatible system metric names.
+
+Platform collectors own OS-specific acquisition. This module owns metric
+semantics, tags, independent check cadence, buffering and scheduling so Windows
+and Linux emit the same contract. Rate metrics are omitted on first observation,
+a counter reset, or an excessive sampling gap rather than inventing a zero.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import socket
+import threading
+import time
+from typing import Callable, Iterable
+
+from .custom_metrics import BoundedMetricBuffer, CustomMetricPoint, MetricBufferStats
+from .host_filesystem import FilesystemStats, NativeFilesystemMonitor
+from .host_io import HostIORateTracker, HostIOSnapshot, IORate, create_native_io_backend
+from .host_monitor import HostStats
+from .host_process import NativeProcessMonitor, ProcessSummary
+
+
+@dataclass(frozen=True, slots=True)
+class HostIOCollection:
+    snapshot: HostIOSnapshot
+    network_rates: tuple[IORate, ...]
+    disk_rates: tuple[IORate, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SystemMetricsWorkerSnapshot:
+    running: bool
+    collections: int
+    failed_collections: int
+    partial_collections: int
+    last_error: str | None
+    network_error: str | None
+    disk_error: str | None
+    filesystem_error: str | None
+    process_error: str | None
+    buffer: MetricBufferStats
+
+
+def _tags(hostname: str, device: str) -> tuple[str, str]:
+    return (f"host:{hostname}", f"device:{device}")
+
+
+def normalize_host_stats_metrics(
+    samples: Iterable[HostStats],
+    *,
+    hostname: str,
+) -> tuple[CustomMetricPoint, ...]:
+    """Map native CPU/memory/load/uptime samples to safe System check metrics.
+
+    Only metrics that can be represented faithfully by the current normalized
+    HostStats contract are emitted. In particular ``system.mem.used`` is not
+    synthesized from MemAvailable on Linux because Datadog's documented Linux
+    definition uses a different free/cached breakdown.
+    """
+    host = hostname.strip() or "unknown"
+    host_tags = (f"host:{host}",)
+    points: list[CustomMetricPoint] = []
+    for sample in samples:
+        timestamp = float(sample.timestamp)
+        common = {
+            "timestamp": timestamp,
+            "tags": host_tags,
+            "metric_type": "gauge",
+            "source": "system",
+            "target_key": "host-core",
+        }
+        if sample.cpu_percent is not None:
+            points.append(CustomMetricPoint(
+                name="system.cpu.idle",
+                value=max(0.0, min(100.0, 100.0 - float(sample.cpu_percent))),
+                unit="percent",
+                **common,
+            ))
+        points.append(CustomMetricPoint(
+            name="system.cpu.num_cores",
+            value=float(sample.logical_cpus),
+            unit="core",
+            **common,
+        ))
+        total_bytes = float(sample.memory_total_mb) * 1024.0 * 1024.0
+        usable_bytes = float(sample.memory_available_mb) * 1024.0 * 1024.0
+        usable_fraction = usable_bytes / total_bytes if total_bytes > 0 else 0.0
+        for name, value, unit in (
+            ("system.mem.total", total_bytes, "byte"),
+            ("system.mem.usable", usable_bytes, "byte"),
+            ("system.mem.pct_usable", usable_fraction, "fraction"),
+            ("system.uptime", max(0.0, float(sample.uptime_s)), "second"),
+        ):
+            points.append(CustomMetricPoint(
+                name=name,
+                value=value,
+                unit=unit,
+                **common,
+            ))
+        loads = (
+            ("system.load.1", "system.load.norm.1", sample.load_1),
+            ("system.load.5", "system.load.norm.5", sample.load_5),
+            ("system.load.15", "system.load.norm.15", sample.load_15),
+        )
+        cpus = max(1, int(sample.logical_cpus))
+        for raw_name, normalized_name, value in loads:
+            if value is None:
+                continue
+            points.append(CustomMetricPoint(
+                name=raw_name,
+                value=float(value),
+                unit=None,
+                **common,
+            ))
+            points.append(CustomMetricPoint(
+                name=normalized_name,
+                value=float(value) / cpus,
+                unit=None,
+                **common,
+            ))
+    return tuple(points)
+
+
+def normalize_host_io_metrics(
+    collection: HostIOCollection,
+    *,
+    hostname: str,
+) -> tuple[CustomMetricPoint, ...]:
+    """Convert raw host I/O plus derived rates into shared system metrics."""
+    hostname = hostname.strip() or "unknown"
+    timestamp = float(collection.snapshot.timestamp)
+    network_rates = {rate.name: rate for rate in collection.network_rates}
+    disk_rates = {rate.name: rate for rate in collection.disk_rates}
+    points: list[CustomMetricPoint] = []
+
+    for counters in collection.snapshot.network:
+        tags = _tags(hostname, counters.interface)
+        for name, value, unit in (
+            ("system.net.packets_in.count", counters.rx_packets, "packet"),
+            ("system.net.packets_out.count", counters.tx_packets, "packet"),
+            ("system.net.packets_in.error", counters.rx_errors, "error"),
+            ("system.net.packets_out.error", counters.tx_errors, "error"),
+            ("system.net.packets_in.drop", counters.rx_dropped, "packet"),
+            ("system.net.packets_out.drop", counters.tx_dropped, "packet"),
+        ):
+            points.append(CustomMetricPoint(
+                timestamp=timestamp,
+                name=name,
+                value=float(value),
+                tags=tags,
+                metric_type="gauge",
+                unit=unit,
+                source="system",
+                target_key="host-network",
+            ))
+
+        rate = network_rates.get(counters.interface)
+        if rate is not None and rate.read_bps is not None:
+            points.append(CustomMetricPoint(
+                timestamp=timestamp,
+                name="system.net.bytes_rcvd",
+                value=float(rate.read_bps),
+                tags=tags,
+                metric_type="gauge",
+                unit="byte",
+                source="system",
+                target_key="host-network",
+            ))
+        if rate is not None and rate.write_bps is not None:
+            points.append(CustomMetricPoint(
+                timestamp=timestamp,
+                name="system.net.bytes_sent",
+                value=float(rate.write_bps),
+                tags=tags,
+                metric_type="gauge",
+                unit="byte",
+                source="system",
+                target_key="host-network",
+            ))
+
+    for counters in collection.snapshot.disks:
+        rate = disk_rates.get(counters.device)
+        if rate is None:
+            continue
+        tags = _tags(hostname, counters.device)
+        for name, value, unit in (
+            ("system.io.r_s", rate.read_ops_s, "request"),
+            ("system.io.w_s", rate.write_ops_s, "request"),
+            (
+                "system.io.rkb_s",
+                None if rate.read_bps is None else rate.read_bps / 1024.0,
+                "kibibyte",
+            ),
+            (
+                "system.io.wkb_s",
+                None if rate.write_bps is None else rate.write_bps / 1024.0,
+                "kibibyte",
+            ),
+        ):
+            if value is None:
+                continue
+            points.append(CustomMetricPoint(
+                timestamp=timestamp,
+                name=name,
+                value=float(value),
+                tags=tags,
+                metric_type="gauge",
+                unit=unit,
+                source="system",
+                target_key="host-io",
+            ))
+
+    return tuple(points)
+
+
+def normalize_filesystem_metrics(
+    stats: Iterable[FilesystemStats],
+    *,
+    hostname: str,
+) -> tuple[CustomMetricPoint, ...]:
+    """Normalize filesystem capacity using Datadog's documented disk names."""
+    hostname = hostname.strip() or "unknown"
+    points: list[CustomMetricPoint] = []
+    for item in stats:
+        device = item.device or item.mountpoint
+        tag_values = list(_tags(hostname, device))
+        tag_values.append(f"mountpoint:{item.mountpoint}")
+        if item.filesystem:
+            tag_values.append(f"filesystem:{item.filesystem}")
+        tags = tuple(tag_values)
+        for name, value, unit in (
+            ("system.disk.total", float(item.total_bytes), "byte"),
+            ("system.disk.free", float(item.free_bytes), "byte"),
+            ("system.disk.used", float(item.used_bytes), "byte"),
+            ("system.disk.in_use", float(item.used_percent) / 100.0, "fraction"),
+            ("system.disk.utilized", float(item.used_percent), "percent"),
+        ):
+            points.append(CustomMetricPoint(
+                timestamp=float(item.timestamp),
+                name=name,
+                value=value,
+                tags=tags,
+                metric_type="gauge",
+                unit=unit,
+                source="system",
+                target_key="host-filesystem",
+            ))
+    return tuple(points)
+
+
+def normalize_process_metrics(
+    stats: ProcessSummary,
+    *,
+    hostname: str,
+) -> tuple[CustomMetricPoint, ...]:
+    """Normalize a bounded host process summary without per-PID cardinality.
+
+    Datadog's documented ``system.processes.*`` metrics describe configured
+    process checks rather than one cross-platform host-total contract, so these
+    project-owned names intentionally avoid claiming identical semantics.
+    """
+    host = hostname.strip() or "unknown"
+    common = {
+        "timestamp": float(stats.timestamp),
+        "metric_type": "gauge",
+        "source": "system",
+        "target_key": "host-process",
+    }
+    points = [
+        CustomMetricPoint(
+            name="container_profiler.host.processes",
+            value=float(stats.processes),
+            tags=(f"host:{host}",),
+            unit="process",
+            **common,
+        ),
+        CustomMetricPoint(
+            name="container_profiler.host.threads",
+            value=float(stats.threads),
+            tags=(f"host:{host}",),
+            unit="thread",
+            **common,
+        ),
+        CustomMetricPoint(
+            name="container_profiler.host.processes_skipped",
+            value=float(stats.skipped_processes),
+            tags=(f"host:{host}",),
+            unit="process",
+            **common,
+        ),
+    ]
+    for state, value in (
+        ("running", stats.running),
+        ("sleeping", stats.sleeping),
+        ("blocked", stats.blocked),
+        ("stopped", stats.stopped),
+        ("zombie", stats.zombies),
+        ("unknown", stats.unknown),
+    ):
+        if value is None:
+            continue
+        points.append(CustomMetricPoint(
+            name="container_profiler.host.process_state",
+            value=float(value),
+            tags=(f"host:{host}", f"state:{state}"),
+            unit="process",
+            **common,
+        ))
+    return tuple(points)
+
+
+class NativeSystemMetricsCollector:
+    """Platform-neutral facade over native network, I/O, filesystem and process checks."""
+
+    def __init__(
+        self,
+        backend=None,
+        *,
+        tracker: HostIORateTracker | None = None,
+        filesystem_monitor: NativeFilesystemMonitor | None = None,
+        filesystem_interval_s: float = 15.0,
+        process_monitor: NativeProcessMonitor | None = None,
+        process_interval_s: float = 10.0,
+        hostname: Callable[[], str] = socket.gethostname,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if filesystem_interval_s <= 0 or process_interval_s <= 0:
+            raise ValueError("system check intervals must be positive")
+        self.backend = backend or create_native_io_backend()
+        self.tracker = tracker or HostIORateTracker()
+        self.filesystem_monitor = filesystem_monitor
+        self.filesystem_interval_s = float(filesystem_interval_s)
+        self.process_monitor = process_monitor
+        self.process_interval_s = float(process_interval_s)
+        self.hostname = hostname
+        self.monotonic_clock = monotonic_clock
+        self._next_filesystem_due = 0.0
+        self._next_process_due = 0.0
+        self.last_network_error: str | None = None
+        self.last_disk_error: str | None = None
+        self.last_filesystem_error: str | None = None
+        self.last_process_error: str | None = None
+
+    def collect(self) -> tuple[CustomMetricPoint, ...]:
+        snapshot = self.backend.read()
+        self.last_network_error = snapshot.network_error
+        self.last_disk_error = snapshot.disk_error
+        collection = HostIOCollection(
+            snapshot=snapshot,
+            network_rates=self.tracker.update_network(snapshot.timestamp, snapshot.network),
+            disk_rates=self.tracker.update_disks(snapshot.timestamp, snapshot.disks),
+        )
+        host = str(self.hostname() or "unknown")
+        points = list(normalize_host_io_metrics(collection, hostname=host))
+
+        now = float(self.monotonic_clock())
+        filesystem_monitor = self.filesystem_monitor
+        if filesystem_monitor is not None and now >= self._next_filesystem_due:
+            filesystem_stats = filesystem_monitor.get_stats()
+            self.last_filesystem_error = filesystem_monitor.last_error
+            points.extend(normalize_filesystem_metrics(filesystem_stats, hostname=host))
+            # Schedule from completion/current time, never catch up after sleep.
+            self._next_filesystem_due = now + self.filesystem_interval_s
+
+        process_monitor = self.process_monitor
+        if process_monitor is not None and now >= self._next_process_due:
+            process_stats = process_monitor.get_stats()
+            self.last_process_error = process_monitor.last_error
+            if process_stats is not None:
+                points.extend(normalize_process_metrics(process_stats, hostname=host))
+            # Failure does not turn into a hot retry loop.
+            self._next_process_due = now + self.process_interval_s
+
+        return tuple(points)
+
+
+class SystemMetricsRuntimeWorker:
+    """Continuously collect native system checks into a bounded metric buffer."""
+
+    def __init__(
+        self,
+        collector: NativeSystemMetricsCollector | None = None,
+        *,
+        interval_s: float = 1.0,
+        max_points: int = 20_000,
+        max_bytes: int = 16 * 1024 * 1024,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if interval_s <= 0:
+            raise ValueError("interval_s must be positive")
+        self.collector = collector or NativeSystemMetricsCollector(
+            filesystem_monitor=NativeFilesystemMonitor(),
+            process_monitor=NativeProcessMonitor(),
+        )
+        self.interval_s = float(interval_s)
+        self.monotonic_clock = monotonic_clock
+        self.buffer = BoundedMetricBuffer(max_points=max_points, max_bytes=max_bytes)
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._stop_requested = False
+        self._collections = 0
+        self._failed_collections = 0
+        self._partial_collections = 0
+        self._last_error: str | None = None
+
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self) -> None:
+        with self._condition:
+            if self.is_running():
+                return
+            self._stop_requested = False
+            self._thread = threading.Thread(
+                target=self._run,
+                name="native-system-metrics",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def collect_once(self) -> int:
+        """Run one collection cycle; exposed for deterministic unit tests."""
+        try:
+            points = self.collector.collect()
+        except Exception as exc:
+            with self._condition:
+                self._failed_collections += 1
+                self._last_error = str(exc)
+            return 0
+
+        accepted = self.buffer.append_many(points)
+        with self._condition:
+            self._collections += 1
+            self._last_error = None
+            if (
+                self.collector.last_network_error
+                or self.collector.last_disk_error
+                or self.collector.last_filesystem_error
+                or self.collector.last_process_error
+            ):
+                self._partial_collections += 1
+        return accepted
+
+    def drain_points(self, limit: int = 1000) -> tuple[CustomMetricPoint, ...]:
+        return self.buffer.drain(limit)
+
+    def requeue_points(self, points: Iterable[CustomMetricPoint]) -> int:
+        return self.buffer.requeue_front(points)
+
+    def snapshot(self) -> SystemMetricsWorkerSnapshot:
+        with self._condition:
+            return SystemMetricsWorkerSnapshot(
+                running=self.is_running(),
+                collections=self._collections,
+                failed_collections=self._failed_collections,
+                partial_collections=self._partial_collections,
+                last_error=self._last_error,
+                network_error=self.collector.last_network_error,
+                disk_error=self.collector.last_disk_error,
+                filesystem_error=self.collector.last_filesystem_error,
+                process_error=self.collector.last_process_error,
+                buffer=self.buffer.stats(),
+            )
+
+    def stop(self, timeout_s: float = 2.0) -> bool:
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(max(0.0, timeout_s))
+        stopped = not thread.is_alive()
+        if stopped:
+            self._thread = None
+        return stopped
+
+    def _run(self) -> None:
+        next_due = float(self.monotonic_clock())
+        while True:
+            with self._condition:
+                if self._stop_requested:
+                    return
+            now = float(self.monotonic_clock())
+            if now < next_due:
+                with self._condition:
+                    if self._stop_requested:
+                        return
+                    self._condition.wait(min(next_due - now, 0.25))
+                continue
+            self.collect_once()
+            finished = float(self.monotonic_clock())
+            # Slow native calls and suspend never trigger a catch-up burst.
+            next_due = max(next_due + self.interval_s, finished + self.interval_s)

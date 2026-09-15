@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "metrics_endpoint": "https://observability.example.com/v1/metrics",
+  "headers_from_env": {
+    "Authorization": "CONTAINER_PROFILER_FORWARD_AUTH"
+  },
+  "batch_points": 250,
+  "max_payload_bytes": 1048576,
+  "timeout_s": 5,
+  "poll_interval_s": 1,
+  "base_delay_s": 1,
+  "max_delay_s": 300,
+  "jitter": 0.2,
+  "queue_max_items": 50000,
+  "queue_max_bytes": 268435456
+}

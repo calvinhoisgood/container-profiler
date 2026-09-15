@@ -1,0 +1,31 @@
+name: unit-tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run hardware-free core tests
+        working-directory: container-profiler
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Headless agent import smoke
+        working-directory: container-profiler
+        run: python agent.py --help
+      - name: Windows service host import smoke
+        working-directory: container-profiler
+        run: python agent_service.py --help
+      - name: Compile sources and entry points
+        run: python -m compileall -q container-profiler/src && python -m py_compile container-profiler/agent.py container-profiler/agent_service.py container-profiler/main.py

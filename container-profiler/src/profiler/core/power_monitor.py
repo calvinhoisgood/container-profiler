@@ -1,228 +1,262 @@
+"""Optional power sensors.
+
+NVIDIA metrics use the vendor NVML interface directly. HWiNFO shared memory is
+kept only as an opt-in compatibility provider for CPU package power; the core
+agent no longer attempts to connect to third-party monitoring software by
+default.
 """
-功耗監控模組 - HWiNFO + NVIDIA NVML
-"""
+from __future__ import annotations
+
 import ctypes
-from ctypes import wintypes
+import os
 import struct
-from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
-@dataclass
-class PowerStats:
-    """功耗統計"""
-    cpu_power_w: Optional[float] = None  # CPU 封裝功耗
-    gpu_power_w: Optional[float] = None  # GPU 功耗
-    gpu_util_percent: Optional[float] = None  # GPU 利用率
-    gpu_memory_mb: Optional[float] = None  # GPU 顯存使用
-    gpu_temp_c: Optional[float] = None  # GPU 溫度
+from .models import PowerStats
 
-# Windows API Constants & Types
-FILE_MAP_READ = 0x0004
-kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-
-OpenFileMappingW = kernel32.OpenFileMappingW
-OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
-OpenFileMappingW.restype = wintypes.HANDLE
-
-MapViewOfFile = kernel32.MapViewOfFile
-MapViewOfFile.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
-MapViewOfFile.restype = wintypes.LPVOID
-
-UnmapViewOfFile = kernel32.UnmapViewOfFile
-UnmapViewOfFile.argtypes = [wintypes.LPCVOID]
-UnmapViewOfFile.restype = wintypes.BOOL
-
-CloseHandle = kernel32.CloseHandle
-CloseHandle.argtypes = [wintypes.HANDLE]
-CloseHandle.restype = wintypes.BOOL
 
 class HWiNFOReader:
-    """HWiNFO 共享內存讀取器"""
-    
-    HWINFO_SENSORS_SM_NAME = "Global\HWiNFO_SENS_SM2"
-    
-    def __init__(self):
-        self.hMap = None
-        self.pBuf = None
-        self._connect()
-    
-    def _connect(self):
-        """連接 HWiNFO 共享內存"""
+    """Read CPU Package Power from HWiNFO's Windows shared memory.
+
+    This is a compatibility backend, not a core dependency. It is import-safe
+    on non-Windows platforms and is instantiated by ``PowerMonitor`` only when
+    explicitly enabled.
+    """
+
+    SHARED_MEMORY_NAME = r"Global\HWiNFO_SENS_SM2"
+    _HEADER = struct.Struct("<IIIQIIIIII")
+    _READING = struct.Struct("<III128s128s16sdddd")
+
+    def __init__(self, *, os_name: str | None = None) -> None:
+        self._os_name = os_name or os.name
+        self._mapping: Any | None = None
+        self._view: int | None = None
+        self._kernel32: Any | None = None
+        self.last_error: str | None = None
+        if self._os_name == "nt":
+            self._connect()
+        else:
+            self.last_error = "HWiNFO shared memory is only available on Windows"
+
+    def _connect(self) -> None:
         try:
-            self.hMap = OpenFileMappingW(FILE_MAP_READ, False, self.HWINFO_SENSORS_SM_NAME)
-            if not self.hMap:
-                print(f"HWiNFO 連接失敗: 無法打開文件映射 ({ctypes.get_last_error()})")
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_mapping = kernel32.OpenFileMappingW
+            open_mapping.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+            open_mapping.restype = wintypes.HANDLE
+
+            map_view = kernel32.MapViewOfFile
+            map_view.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.c_size_t,
+            ]
+            map_view.restype = ctypes.c_void_p
+
+            mapping = open_mapping(0x0004, False, self.SHARED_MEMORY_NAME)
+            if not mapping:
+                self.last_error = f"OpenFileMappingW failed ({ctypes.get_last_error()})"
                 return
 
-            self.pBuf = MapViewOfFile(self.hMap, FILE_MAP_READ, 0, 0, 0)
-            if not self.pBuf:
-                print(f"HWiNFO 連接失敗: 無法映射視圖 ({ctypes.get_last_error()})")
-                CloseHandle(self.hMap)
-                self.hMap = None
+            view = map_view(mapping, 0x0004, 0, 0, 0)
+            if not view:
+                kernel32.CloseHandle(mapping)
+                self.last_error = f"MapViewOfFile failed ({ctypes.get_last_error()})"
                 return
-                
-            print("HWiNFO 連接成功")
-            
-        except Exception as e:
-            print(f"HWiNFO 初始化異常: {e}")
-            self.pBuf = None
-    
+
+            self._kernel32 = kernel32
+            self._mapping = mapping
+            self._view = int(view)
+            self.last_error = None
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.close()
+
     def is_connected(self) -> bool:
-        return self.pBuf is not None
-    
-    def _read_buffer(self, offset, size):
-        if not self.pBuf:
-            return None
-        address = self.pBuf + offset
-        return (ctypes.c_byte * size).from_address(address)
+        return self._view is not None
+
+    def _read_bytes(self, offset: int, size: int) -> bytes:
+        if self._view is None:
+            raise RuntimeError("HWiNFO shared memory is not connected")
+        if offset < 0 or size < 0:
+            raise ValueError("negative shared-memory offset/size")
+        return ctypes.string_at(self._view + offset, size)
+
+    @staticmethod
+    def _decode_label(raw: bytes) -> str:
+        return raw.split(b"\x00", 1)[0].decode("utf-8", errors="ignore").strip()
 
     def get_cpu_power(self) -> Optional[float]:
-        """讀取 CPU Package Power"""
-        if not self.pBuf:
+        if self._view is None:
             return None
-            
+
         try:
-            # Header Format: '=IIIQIIIIII' (44 bytes, standard alignment)
-            # Signature, Version, Revision, PollTime, OffsetSensor, SizeSensor, NumSensor, OffsetReading, SizeReading, NumReading
-            header_size = 44
-            header_buf = self._read_buffer(0, header_size)
-            if not header_buf:
-                return None
-                
-            header_data = struct.unpack('=IIIQIIIIII', header_buf)
-            
-            offset_reading_section = header_data[7]
-            size_reading_element = header_data[8]
-            num_reading_elements = header_data[9]
-            
-            # Reading Element Format: '=III128s128s16sdddd'
-            # 0: tReading (I)
-            # 1: dwSensorIndex (I)
-            # 2: dwReadingID (I)
-            # 3: szLabelOrig (128s)
-            # 4: szLabelUser (128s)
-            # 5: szUnit (16s)
-            # 6: Value (d)
-            # 7: ValueMin (d)
-            # 8: ValueMax (d)
-            # 9: ValueAvg (d)
-            reading_fmt = '=III128s128s16sdddd'
-            reading_struct = struct.Struct(reading_fmt)
-            struct_size = reading_struct.size
-            
-            # 遍歷所有 Reading Elements
-            for i in range(num_reading_elements):
-                start = offset_reading_section + i * size_reading_element
-                read_size = min(size_reading_element, struct_size)
-                
-                reading_buf = self._read_buffer(start, read_size)
-                if not reading_buf:
-                    continue
-                    
-                reading = reading_struct.unpack(reading_buf)
-                
-                label_orig = reading[3].replace(b'\x00', b'').decode('utf-8', errors='ignore')
-                label_user = reading[4].replace(b'\x00', b'').decode('utf-8', errors='ignore')
-                
-                # 模糊匹配 CPU Package Power
-                target = "CPU Package Power"
-                if target in label_orig or target in label_user:
-                    # print(f"Found: {label_orig} = {reading[6]}")
-                    return reading[6] # Value
-                    
+            header = self._HEADER.unpack(self._read_bytes(0, self._HEADER.size))
+            reading_offset = int(header[7])
+            reading_size = int(header[8])
+            reading_count = int(header[9])
+
+            if reading_offset <= 0 or reading_count < 0:
+                raise ValueError("invalid HWiNFO reading section")
+            if reading_size < self._READING.size:
+                raise ValueError(
+                    f"unsupported HWiNFO reading size: {reading_size} < {self._READING.size}"
+                )
+            if reading_count > 100_000:
+                raise ValueError(f"unreasonable HWiNFO reading count: {reading_count}")
+
+            target = "cpu package power"
+            for index in range(reading_count):
+                offset = reading_offset + index * reading_size
+                values = self._READING.unpack(
+                    self._read_bytes(offset, self._READING.size)
+                )
+                original = self._decode_label(values[3]).lower()
+                user = self._decode_label(values[4]).lower()
+                if target in original or target in user:
+                    value = float(values[6])
+                    return value if value >= 0 else None
+
             return None
-            
-        except Exception as e:
-            # print(f"HWiNFO 讀取異常: {e}")
+        except Exception as exc:
+            self.last_error = str(exc)
             return None
-    
-    def close(self):
-        if self.pBuf:
-            UnmapViewOfFile(self.pBuf)
-            self.pBuf = None
-        if self.hMap:
-            CloseHandle(self.hMap)
-            self.hMap = None
+
+    def close(self) -> None:
+        if self._kernel32 is not None and self._view is not None:
+            try:
+                self._kernel32.UnmapViewOfFile(ctypes.c_void_p(self._view))
+            except Exception:
+                pass
+        if self._kernel32 is not None and self._mapping is not None:
+            try:
+                self._kernel32.CloseHandle(self._mapping)
+            except Exception:
+                pass
+        self._view = None
+        self._mapping = None
+
+
+class DisabledCPUPowerReader:
+    """No-op CPU-power provider used by the self-contained default runtime."""
+
+    last_error = "CPU package power compatibility provider is disabled"
+
+    def is_connected(self) -> bool:
+        return False
+
+    def get_cpu_power(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
 
 class NVMLReader:
-    """NVIDIA GPU 監控器"""
-    
-    def __init__(self):
+    """NVIDIA GPU metrics with injectable official NVML binding."""
+
+    def __init__(self, module: Any | None = None) -> None:
+        self.pynvml: Any | None = None
+        self.device_count = 0
         self.initialized = False
-        self._init()
-    
-    def _init(self):
+        self.last_error: str | None = None
+        self._init(module)
+
+    def _init(self, module: Any | None) -> None:
         try:
-            import pynvml
-            pynvml.nvmlInit()
-            self.pynvml = pynvml
-            self.device_count = pynvml.nvmlDeviceGetCount()
+            if module is None:
+                # nvidia-ml-py exposes the vendor API through this import name.
+                import pynvml as module
+            module.nvmlInit()
+            self.pynvml = module
+            self.device_count = int(module.nvmlDeviceGetCount())
             self.initialized = True
-        except Exception:
+            self.last_error = None
+        except Exception as exc:
+            self.last_error = str(exc)
             self.initialized = False
-    
+            self.device_count = 0
+
     def is_available(self) -> bool:
         return self.initialized and self.device_count > 0
-    
-    def get_gpu_stats(self, device_index: int = 0) -> Optional[dict]:
-        """獲取 GPU 統計"""
-        if not self.initialized:
+
+    def get_gpu_stats(self, device_index: int = 0) -> Optional[dict[str, float]]:
+        if not self.is_available() or self.pynvml is None:
             return None
-        
+        if not 0 <= device_index < self.device_count:
+            self.last_error = f"GPU index out of range: {device_index}"
+            return None
+
         try:
             handle = self.pynvml.nvmlDeviceGetHandleByIndex(device_index)
-            
-            power = self.pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW -> W
             util = self.pynvml.nvmlDeviceGetUtilizationRates(handle)
             memory = self.pynvml.nvmlDeviceGetMemoryInfo(handle)
-            temp = self.pynvml.nvmlDeviceGetTemperature(handle, 0)
-            
-            return {
-                "power_w": round(power, 2),
-                "gpu_util": util.gpu,
-                "memory_used_mb": round(memory.used / 1024 / 1024, 2),
-                "memory_total_mb": round(memory.total / 1024 / 1024, 2),
-                "temperature_c": temp
+            temp_sensor = getattr(self.pynvml, "NVML_TEMPERATURE_GPU", 0)
+            result = {
+                "power_w": float(self.pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0,
+                "gpu_util": float(util.gpu),
+                "memory_used_mb": float(memory.used) / 1024.0 / 1024.0,
+                "memory_total_mb": float(memory.total) / 1024.0 / 1024.0,
+                "temperature_c": float(
+                    self.pynvml.nvmlDeviceGetTemperature(handle, temp_sensor)
+                ),
             }
-        except Exception as e:
-            print(f"讀取 GPU 統計失敗: {e}")
+            self.last_error = None
+            return result
+        except Exception as exc:
+            self.last_error = str(exc)
             return None
-    
-    def close(self):
-        if self.initialized:
+
+    def close(self) -> None:
+        if self.initialized and self.pynvml is not None:
             try:
                 self.pynvml.nvmlShutdown()
-            except:
+            except Exception:
                 pass
+        self.initialized = False
+
 
 class PowerMonitor:
-    """統一功耗監控接口"""
-    
-    def __init__(self):
-        self.hwinfo: Optional[HWiNFOReader] = HWiNFOReader()
-        self.nvml: Optional[NVMLReader] = NVMLReader()
-    
+    """Facade for optional power/GPU sources.
+
+    HWiNFO is disabled by default. Set ``enable_hwinfo=True`` (or the
+    ``CONTAINER_PROFILER_ENABLE_HWINFO=1`` environment variable) if the user
+    explicitly wants the compatibility CPU package-power source.
+    """
+
+    def __init__(
+        self,
+        *,
+        hwinfo: Any | None = None,
+        nvml: NVMLReader | None = None,
+        enable_hwinfo: bool | None = None,
+    ) -> None:
+        if hwinfo is not None:
+            self.hwinfo = hwinfo
+        else:
+            if enable_hwinfo is None:
+                enable_hwinfo = os.environ.get("CONTAINER_PROFILER_ENABLE_HWINFO", "").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }
+            self.hwinfo = HWiNFOReader() if enable_hwinfo else DisabledCPUPowerReader()
+        self.nvml = nvml if nvml is not None else NVMLReader()
+
     def get_power_stats(self) -> PowerStats:
-        """獲取功耗統計"""
-        stats = PowerStats()
-        
-        # CPU 功耗
-        if self.hwinfo and self.hwinfo.is_connected():
-            stats.cpu_power_w = self.hwinfo.get_cpu_power()
-        
-        # GPU 統計
-        if self.nvml and self.nvml.is_available():
-            gpu_stats = self.nvml.get_gpu_stats()
-            if gpu_stats:
-                stats.gpu_power_w = gpu_stats["power_w"]
-                stats.gpu_util_percent = gpu_stats["gpu_util"]
-                stats.gpu_memory_mb = gpu_stats["memory_used_mb"]
-                stats.gpu_temp_c = gpu_stats["temperature_c"]
-        
-        return stats
-    
-    def close(self):
-        if self.hwinfo:
-            self.hwinfo.close()
-        if self.nvml:
-            self.nvml.close()
+        cpu_power = self.hwinfo.get_cpu_power() if self.hwinfo.is_connected() else None
+        gpu = self.nvml.get_gpu_stats() if self.nvml.is_available() else None
+        return PowerStats(
+            cpu_power_w=cpu_power,
+            gpu_power_w=gpu.get("power_w") if gpu else None,
+            gpu_util_percent=gpu.get("gpu_util") if gpu else None,
+            gpu_memory_mb=gpu.get("memory_used_mb") if gpu else None,
+            gpu_memory_total_mb=gpu.get("memory_total_mb") if gpu else None,
+            gpu_temp_c=gpu.get("temperature_c") if gpu else None,
+        )
+
+    def close(self) -> None:
+        self.hwinfo.close()
+        self.nvml.close()
