@@ -17,6 +17,7 @@ from .custom_metrics import BoundedMetricBuffer, CustomMetricPoint, MetricBuffer
 from .host_filesystem import FilesystemStats, NativeFilesystemMonitor
 from .host_io import HostIORateTracker, HostIOSnapshot, IORate, create_native_io_backend
 from .host_monitor import HostStats
+from .host_process import NativeProcessMonitor, ProcessSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,7 @@ class SystemMetricsWorkerSnapshot:
     network_error: str | None
     disk_error: str | None
     filesystem_error: str | None
+    process_error: str | None
     buffer: MetricBufferStats
 
 
@@ -246,8 +248,69 @@ def normalize_filesystem_metrics(
     return tuple(points)
 
 
+def normalize_process_metrics(
+    stats: ProcessSummary,
+    *,
+    hostname: str,
+) -> tuple[CustomMetricPoint, ...]:
+    """Normalize a bounded host process summary without per-PID cardinality.
+
+    Datadog's documented ``system.processes.*`` metrics describe configured
+    process checks rather than one cross-platform host-total contract, so these
+    project-owned names intentionally avoid claiming identical semantics.
+    """
+    host = hostname.strip() or "unknown"
+    common = {
+        "timestamp": float(stats.timestamp),
+        "metric_type": "gauge",
+        "source": "system",
+        "target_key": "host-process",
+    }
+    points = [
+        CustomMetricPoint(
+            name="container_profiler.host.processes",
+            value=float(stats.processes),
+            tags=(f"host:{host}",),
+            unit="process",
+            **common,
+        ),
+        CustomMetricPoint(
+            name="container_profiler.host.threads",
+            value=float(stats.threads),
+            tags=(f"host:{host}",),
+            unit="thread",
+            **common,
+        ),
+        CustomMetricPoint(
+            name="container_profiler.host.processes_skipped",
+            value=float(stats.skipped_processes),
+            tags=(f"host:{host}",),
+            unit="process",
+            **common,
+        ),
+    ]
+    for state, value in (
+        ("running", stats.running),
+        ("sleeping", stats.sleeping),
+        ("blocked", stats.blocked),
+        ("stopped", stats.stopped),
+        ("zombie", stats.zombies),
+        ("unknown", stats.unknown),
+    ):
+        if value is None:
+            continue
+        points.append(CustomMetricPoint(
+            name="container_profiler.host.process_state",
+            value=float(value),
+            tags=(f"host:{host}", f"state:{state}"),
+            unit="process",
+            **common,
+        ))
+    return tuple(points)
+
+
 class NativeSystemMetricsCollector:
-    """Platform-neutral facade over native network, I/O and filesystem checks."""
+    """Platform-neutral facade over native network, I/O, filesystem and process checks."""
 
     def __init__(
         self,
@@ -256,21 +319,27 @@ class NativeSystemMetricsCollector:
         tracker: HostIORateTracker | None = None,
         filesystem_monitor: NativeFilesystemMonitor | None = None,
         filesystem_interval_s: float = 15.0,
+        process_monitor: NativeProcessMonitor | None = None,
+        process_interval_s: float = 10.0,
         hostname: Callable[[], str] = socket.gethostname,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if filesystem_interval_s <= 0:
-            raise ValueError("filesystem_interval_s must be positive")
+        if filesystem_interval_s <= 0 or process_interval_s <= 0:
+            raise ValueError("system check intervals must be positive")
         self.backend = backend or create_native_io_backend()
         self.tracker = tracker or HostIORateTracker()
         self.filesystem_monitor = filesystem_monitor
         self.filesystem_interval_s = float(filesystem_interval_s)
+        self.process_monitor = process_monitor
+        self.process_interval_s = float(process_interval_s)
         self.hostname = hostname
         self.monotonic_clock = monotonic_clock
         self._next_filesystem_due = 0.0
+        self._next_process_due = 0.0
         self.last_network_error: str | None = None
         self.last_disk_error: str | None = None
         self.last_filesystem_error: str | None = None
+        self.last_process_error: str | None = None
 
     def collect(self) -> tuple[CustomMetricPoint, ...]:
         snapshot = self.backend.read()
@@ -284,14 +353,23 @@ class NativeSystemMetricsCollector:
         host = str(self.hostname() or "unknown")
         points = list(normalize_host_io_metrics(collection, hostname=host))
 
-        monitor = self.filesystem_monitor
         now = float(self.monotonic_clock())
-        if monitor is not None and now >= self._next_filesystem_due:
-            filesystem_stats = monitor.get_stats()
-            self.last_filesystem_error = monitor.last_error
+        filesystem_monitor = self.filesystem_monitor
+        if filesystem_monitor is not None and now >= self._next_filesystem_due:
+            filesystem_stats = filesystem_monitor.get_stats()
+            self.last_filesystem_error = filesystem_monitor.last_error
             points.extend(normalize_filesystem_metrics(filesystem_stats, hostname=host))
             # Schedule from completion/current time, never catch up after sleep.
             self._next_filesystem_due = now + self.filesystem_interval_s
+
+        process_monitor = self.process_monitor
+        if process_monitor is not None and now >= self._next_process_due:
+            process_stats = process_monitor.get_stats()
+            self.last_process_error = process_monitor.last_error
+            if process_stats is not None:
+                points.extend(normalize_process_metrics(process_stats, hostname=host))
+            # Failure does not turn into a hot retry loop.
+            self._next_process_due = now + self.process_interval_s
 
         return tuple(points)
 
@@ -311,7 +389,8 @@ class SystemMetricsRuntimeWorker:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
         self.collector = collector or NativeSystemMetricsCollector(
-            filesystem_monitor=NativeFilesystemMonitor()
+            filesystem_monitor=NativeFilesystemMonitor(),
+            process_monitor=NativeProcessMonitor(),
         )
         self.interval_s = float(interval_s)
         self.monotonic_clock = monotonic_clock
@@ -358,6 +437,7 @@ class SystemMetricsRuntimeWorker:
                 self.collector.last_network_error
                 or self.collector.last_disk_error
                 or self.collector.last_filesystem_error
+                or self.collector.last_process_error
             ):
                 self._partial_collections += 1
         return accepted
@@ -379,6 +459,7 @@ class SystemMetricsRuntimeWorker:
                 network_error=self.collector.last_network_error,
                 disk_error=self.collector.last_disk_error,
                 filesystem_error=self.collector.last_filesystem_error,
+                process_error=self.collector.last_process_error,
                 buffer=self.buffer.stats(),
             )
 
