@@ -1,4 +1,4 @@
-"""Bounded local Explorer for persisted custom metrics."""
+"""Bounded local Explorer for persisted custom and system metrics."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -19,14 +19,14 @@ from PyQt6.QtWidgets import (
 
 
 class CustomMetricsExplorerDialog(QDialog):
-    """Query recent custom metrics without ever loading the whole local store."""
+    """Query recent metric points without ever loading the whole local store."""
 
     MAX_QUERY_ROWS = 5000
 
     def __init__(self, store, parent=None) -> None:
         super().__init__(parent)
         self.store = store
-        self.setWindowTitle("Custom Metrics Explorer")
+        self.setWindowTitle("Metrics Explorer")
         self.resize(1200, 720)
         self._setup_ui()
         self.refresh()
@@ -37,7 +37,7 @@ class CustomMetricsExplorerDialog(QDialog):
 
         filters.addWidget(QLabel("Metric prefix:"))
         self.name_filter = QLineEdit()
-        self.name_filter.setPlaceholderText("例如 demo. / http.requests")
+        self.name_filter.setPlaceholderText("例如 system.net. / demo. / http.requests")
         self.name_filter.returnPressed.connect(self.refresh)
         filters.addWidget(self.name_filter, 2)
 
@@ -49,7 +49,7 @@ class CustomMetricsExplorerDialog(QDialog):
 
         filters.addWidget(QLabel("Source:"))
         self.source_filter = QComboBox()
-        self.source_filter.addItems(("all", "openmetrics", "statsd"))
+        self.source_filter.addItems(("all", "system", "openmetrics", "statsd"))
         filters.addWidget(self.source_filter)
 
         filters.addWidget(QLabel("Rows:"))
