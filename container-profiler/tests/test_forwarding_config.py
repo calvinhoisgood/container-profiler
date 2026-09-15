@@ -39,6 +39,15 @@ class ForwardingConfigTests(unittest.TestCase):
         self.assertEqual(config.header_mapping["Authorization"], "Bearer secret")
         self.assertEqual(config.batch_points, 100)
 
+    def test_disabled_config_does_not_require_secret_environment_value(self):
+        config = parse_forwarding_config({
+            "enabled": False,
+            "metrics_endpoint": "https://intake.example.test/v1/metrics",
+            "headers_from_env": {"Authorization": "MISSING_UNTIL_ENABLED"},
+        }, env={})
+        self.assertFalse(config.enabled)
+        self.assertNotIn("Authorization", config.header_mapping)
+
     def test_external_plain_http_is_rejected_unless_explicitly_allowed(self):
         raw = {
             "enabled": True,
@@ -46,9 +55,7 @@ class ForwardingConfigTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ForwardingConfigError, "plain HTTP"):
             parse_forwarding_config(raw, env={})
-        config = parse_forwarding_config(
-            {**raw, "allow_insecure_http": True}, env={}
-        )
+        config = parse_forwarding_config({**raw, "allow_insecure_http": True}, env={})
         self.assertEqual(config.metrics_endpoint, raw["metrics_endpoint"])
 
     def test_loopback_http_is_allowed_for_local_development(self):
@@ -58,7 +65,7 @@ class ForwardingConfigTests(unittest.TestCase):
         }, env={})
         self.assertTrue(config.enabled)
 
-    def test_unknown_field_embedded_credentials_and_missing_env_are_rejected(self):
+    def test_unknown_field_embedded_credentials_and_enabled_missing_env_rejected(self):
         with self.assertRaisesRegex(ForwardingConfigError, "unknown"):
             parse_forwarding_config({"wat": True}, env={})
         with self.assertRaisesRegex(ForwardingConfigError, "credentials"):
@@ -68,8 +75,14 @@ class ForwardingConfigTests(unittest.TestCase):
             }, env={})
         with self.assertRaisesRegex(ForwardingConfigError, "not set"):
             parse_forwarding_config({
+                "enabled": True,
+                "metrics_endpoint": "https://example.test/metrics",
                 "headers_from_env": {"Authorization": "MISSING"},
             }, env={})
+
+    def test_retry_cap_must_not_be_below_base_delay(self):
+        with self.assertRaisesRegex(ForwardingConfigError, "max_delay_s"):
+            parse_forwarding_config({"base_delay_s": 10, "max_delay_s": 5}, env={})
 
     def test_config_file_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
@@ -153,9 +166,7 @@ class MetricBatchTests(unittest.TestCase):
         )
         small = self.point(2)
         with DurableDeliveryQueue(":memory:") as queue:
-            result = enqueue_metric_points(
-                queue, (huge, small), max_payload_bytes=1024
-            )
+            result = enqueue_metric_points(queue, (huge, small), max_payload_bytes=1024)
             self.assertEqual(result.points_dropped, 1)
             self.assertEqual(result.points_enqueued, 1)
             self.assertEqual(len(queue.due()), 1)
