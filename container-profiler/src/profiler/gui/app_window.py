@@ -15,6 +15,7 @@ from ..core.host_monitor import HostRuntimeWorker
 from ..core.metric_forwarding import enqueue_metric_points
 from ..core.openmetrics import OpenMetricsCollector
 from ..core.openmetrics_runtime import OpenMetricsRuntimeWorker, resolve_openmetrics_for_containers
+from ..core.system_metrics import SystemMetricsRuntimeWorker
 from ..utils.paths import (
     get_alert_config_path,
     get_forwarding_config_path,
@@ -52,6 +53,9 @@ class AppMainWindow(MainWindow):
         self.host_worker: HostRuntimeWorker | None = None
         self.host_runtime_error: str | None = None
         self.host_storage_error: str | None = None
+        self.system_metrics_worker: SystemMetricsRuntimeWorker | None = None
+        self.system_metric_runtime_error: str | None = None
+        self.system_metric_storage_error: str | None = None
         self._agent_drain_ticks = 0
 
         self.forwarding_config = ForwardingConfig()
@@ -65,6 +69,7 @@ class AppMainWindow(MainWindow):
         super().__init__()
         self._setup_workload_toolbar()
         self._setup_host_runtime()
+        self._setup_system_metrics_runtime()
         self._setup_openmetrics_runtime()
         self._reload_forwarding(show_dialog=False)
         self._setup_agent_drain_timer()
@@ -81,6 +86,21 @@ class AppMainWindow(MainWindow):
         except Exception as exc:
             self.host_worker = None
             self.host_runtime_error = str(exc)
+        self._refresh_host_action()
+
+    def _setup_system_metrics_runtime(self) -> None:
+        try:
+            worker = SystemMetricsRuntimeWorker(
+                interval_s=1.0,
+                max_points=20_000,
+                max_bytes=16 * 1024 * 1024,
+            )
+            worker.start()
+            self.system_metrics_worker = worker
+            self.system_metric_runtime_error = None
+        except Exception as exc:
+            self.system_metrics_worker = None
+            self.system_metric_runtime_error = str(exc)
         self._refresh_host_action()
 
     def _setup_openmetrics_runtime(self) -> None:
@@ -125,6 +145,7 @@ class AppMainWindow(MainWindow):
     def _drain_agent_buffers(self) -> None:
         store = self.telemetry_store
         self._drain_custom_metrics(store)
+        self._drain_system_metrics(store)
         self._drain_host_metrics(store)
         self._agent_drain_ticks += 1
 
@@ -147,8 +168,26 @@ class AppMainWindow(MainWindow):
         self._refresh_host_action()
         self._refresh_forwarding_action()
 
-    def _drain_custom_metrics(self, store) -> None:
-        worker = self.openmetrics_worker
+    def _forward_metric_points(self, points) -> None:
+        queue = self.forwarding_queue
+        if not self.forwarding_config.enabled or queue is None or not points:
+            return
+        try:
+            result = enqueue_metric_points(
+                queue,
+                points,
+                max_points_per_batch=self.forwarding_config.batch_points,
+                max_payload_bytes=self.forwarding_config.max_payload_bytes,
+            )
+            self.forwarding_points_enqueued += result.points_enqueued
+            self.forwarding_points_dropped += result.points_dropped
+            self.forwarding_enqueue_error = None
+        except Exception as exc:
+            # Local persistence has already succeeded. Forwarding failure is
+            # independent and must never re-ingest duplicate local points.
+            self.forwarding_enqueue_error = str(exc)
+
+    def _drain_metric_worker(self, worker, store, *, error_attr: str) -> None:
         if worker is None or store is None:
             return
         points = worker.drain_points(self.BUFFER_DRAIN_BATCH)
@@ -156,30 +195,26 @@ class AppMainWindow(MainWindow):
             return
         try:
             store.append_custom_metrics(points)
-            self.custom_metric_storage_error = None
+            setattr(self, error_attr, None)
         except Exception as exc:
             worker.requeue_points(points)
-            self.custom_metric_storage_error = str(exc)
+            setattr(self, error_attr, str(exc))
             return
+        self._forward_metric_points(points)
 
-        # Remote delivery is deliberately downstream of durable local storage.
-        # A remote outage can therefore never make local Explorer history vanish.
-        queue = self.forwarding_queue
-        if self.forwarding_config.enabled and queue is not None:
-            try:
-                result = enqueue_metric_points(
-                    queue,
-                    points,
-                    max_points_per_batch=self.forwarding_config.batch_points,
-                    max_payload_bytes=self.forwarding_config.max_payload_bytes,
-                )
-                self.forwarding_points_enqueued += result.points_enqueued
-                self.forwarding_points_dropped += result.points_dropped
-                self.forwarding_enqueue_error = None
-            except Exception as exc:
-                # Local persistence has already succeeded. Forwarding failure is
-                # reported independently and must not re-ingest duplicate points.
-                self.forwarding_enqueue_error = str(exc)
+    def _drain_custom_metrics(self, store) -> None:
+        self._drain_metric_worker(
+            self.openmetrics_worker,
+            store,
+            error_attr="custom_metric_storage_error",
+        )
+
+    def _drain_system_metrics(self, store) -> None:
+        self._drain_metric_worker(
+            self.system_metrics_worker,
+            store,
+            error_attr="system_metric_storage_error",
+        )
 
     def _drain_host_metrics(self, store) -> None:
         worker = self.host_worker
@@ -202,7 +237,7 @@ class AppMainWindow(MainWindow):
 
         self.host_action = QAction("Host", self)
         self.host_action.setToolTip(
-            "Native host CPU/memory/uptime: Windows Kernel32 或 Linux /proc，不依賴 HWiNFO"
+            "Native host CPU/memory/uptime/network/disk I/O: Windows APIs 或 Linux /proc，不依賴 HWiNFO"
         )
         self.host_action.setEnabled(self.telemetry_store is not None)
         self.host_action.triggered.connect(self._show_host_metrics)
@@ -216,7 +251,7 @@ class AppMainWindow(MainWindow):
 
         self.custom_metric_action = QAction("自訂指標", self)
         self.custom_metric_action.setToolTip(
-            "Docker label Autodiscovery → background OpenMetrics scrape → bounded buffer → SQLite"
+            "OpenMetrics 與 native system metrics → bounded buffers → SQLite → optional forwarding"
         )
         self.custom_metric_action.setEnabled(self.telemetry_store is not None)
         self.custom_metric_action.triggered.connect(self._show_custom_metrics)
@@ -345,27 +380,51 @@ class AppMainWindow(MainWindow):
         if action is None:
             return
         worker = self.host_worker
+        system_worker = self.system_metrics_worker
         if worker is None:
             action.setText("Host unavailable")
-            if self.host_runtime_error:
-                action.setToolTip(self.host_runtime_error)
+            details = [self.host_runtime_error] if self.host_runtime_error else []
+            if self.system_metric_runtime_error:
+                details.append("I/O: " + self.system_metric_runtime_error)
+            if details:
+                action.setToolTip("\n".join(details))
             return
         snapshot = worker.snapshot()
         stats = snapshot.last_stats
+        io_text = ""
+        io_details: list[str] = []
+        if system_worker is not None:
+            io_snapshot = system_worker.snapshot()
+            io_text = (
+                f" / IO q {io_snapshot.buffer.queued_points} "
+                f"drop {io_snapshot.buffer.dropped_points}"
+            )
+            if io_snapshot.last_error:
+                io_details.append("I/O collector: " + io_snapshot.last_error)
+            if io_snapshot.network_error:
+                io_details.append("network: " + io_snapshot.network_error)
+            if io_snapshot.disk_error:
+                io_details.append("disk I/O: " + io_snapshot.disk_error)
+        elif self.system_metric_runtime_error:
+            io_details.append("I/O runtime: " + self.system_metric_runtime_error)
+
         if stats is None:
             action.setText(
-                f"Host starting / {snapshot.queued_samples} queued / {snapshot.dropped_samples} dropped"
+                f"Host starting / {snapshot.queued_samples} queued / {snapshot.dropped_samples} dropped{io_text}"
             )
         else:
             cpu = "-" if stats.cpu_percent is None else f"{stats.cpu_percent:.1f}%"
             action.setText(
-                f"Host CPU {cpu} / MEM {stats.memory_percent:.1f}% / {snapshot.dropped_samples} dropped"
+                f"Host CPU {cpu} / MEM {stats.memory_percent:.1f}% / {snapshot.dropped_samples} dropped{io_text}"
             )
         details = []
         if snapshot.last_error:
             details.append("collector: " + snapshot.last_error)
         if self.host_storage_error:
             details.append("storage: " + self.host_storage_error)
+        if self.system_metric_storage_error:
+            details.append("I/O storage: " + self.system_metric_storage_error)
+        details.extend(io_details)
         if details:
             action.setToolTip("\n".join(details))
 
@@ -521,6 +580,11 @@ class AppMainWindow(MainWindow):
         self.host_worker = None
         if host_worker is not None:
             host_worker.stop(timeout_s=2.0)
+
+        system_metrics_worker = self.system_metrics_worker
+        self.system_metrics_worker = None
+        if system_metrics_worker is not None:
+            system_metrics_worker.stop(timeout_s=2.0)
 
         openmetrics_worker = self.openmetrics_worker
         self.openmetrics_worker = None
