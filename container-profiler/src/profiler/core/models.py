@@ -7,7 +7,12 @@ from typing import Optional
 
 @dataclass(slots=True, frozen=True)
 class ContainerInfo:
-    """A concise snapshot of container identity, lifecycle state, and tags."""
+    """A concise snapshot of container identity, lifecycle state, and tags.
+
+    Network/runtime fields come directly from Docker inspect metadata and feed
+    Datadog-style Autodiscovery template resolution without an extra daemon
+    round-trip from the GUI.
+    """
 
     id: str
     name: str
@@ -19,6 +24,11 @@ class ContainerInfo:
     env: Optional[str] = None
     service: Optional[str] = None
     version: Optional[str] = None
+    primary_host: Optional[str] = None
+    network_hosts: tuple[tuple[str, str], ...] = ()
+    exposed_ports: tuple[int, ...] = ()
+    hostname: Optional[str] = None
+    pid: Optional[int] = None
 
 
 @dataclass(slots=True, frozen=True)
