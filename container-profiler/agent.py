@@ -18,6 +18,7 @@ from profiler.core.agent_openmetrics import AgentOpenMetricsWorker
 from profiler.core.agent_runtime import LocalAgentRuntime
 from profiler.core.agent_status import read_agent_status, write_agent_status
 from profiler.core.container_metrics import ContainerMetricsWorker
+from profiler.core.metric_alerts import MetricAlertRuntime
 from profiler.core.statsd_metrics import StatsDMetricsWorker
 from profiler.core.storage import SQLiteTelemetryStore
 from profiler.utils.paths import (
@@ -66,6 +67,18 @@ def build_parser():
         "--no-openmetrics",
         action="store_true",
         help="Disable Docker label based OpenMetrics/Prometheus Autodiscovery",
+    )
+    p.add_argument(
+        "--metric-alerts-config",
+        type=Path,
+        default=None,
+        help="Optional hot-reloadable JSON threshold rules for persisted custom metrics",
+    )
+    p.add_argument(
+        "--metric-alerts-max-series",
+        type=int,
+        default=5000,
+        help="Bound independent alert state cardinality across target/tag series",
     )
     p.add_argument(
         "--forwarding-config",
@@ -129,6 +142,7 @@ def _print_status(path, max_age_s):
         f"container_points={r.get('container_points_persisted', '-')} "
         f"dogstatsd_points={r.get('statsd_points_persisted', '-')} "
         f"openmetrics_points={r.get('openmetrics_points_persisted', '-')} "
+        f"alerts={r.get('alert_events_persisted', '-')} "
         f"self_points={r.get('self_points_persisted', '-')}"
     )
     for key in (
@@ -137,6 +151,7 @@ def _print_status(path, max_age_s):
         "last_container_storage_error",
         "last_statsd_storage_error",
         "last_openmetrics_storage_error",
+        "last_alert_error",
         "last_self_storage_error",
         "last_retention_error",
     ):
@@ -154,6 +169,15 @@ def _print_status(path, max_age_s):
             print(f"openmetrics_docker_error={openmetrics['last_docker_error']}")
         if openmetrics.get("last_sync_error"):
             print(f"openmetrics_sync_error={openmetrics['last_sync_error']}")
+    metric_alerts = r.get("metric_alerts")
+    if isinstance(metric_alerts, dict):
+        print(
+            f"metric_alerts=rules:{metric_alerts.get('rule_count', 0)} "
+            f"series:{metric_alerts.get('tracked_series', 0)} "
+            f"evicted:{metric_alerts.get('evicted_series', 0)}"
+        )
+        if metric_alerts.get("last_config_error"):
+            print(f"metric_alerts_config_error={metric_alerts['last_config_error']}")
     forwarding = r.get("forwarding")
     if isinstance(forwarding, dict):
         queue = forwarding.get("queue") or {}
@@ -187,6 +211,12 @@ def _runtime_for(store, args):
         openmetrics = AgentOpenMetricsWorker(
             discovery_interval_s=args.openmetrics_discovery_interval
         )
+    metric_alerts = None
+    if args.metric_alerts_config is not None:
+        metric_alerts = MetricAlertRuntime(
+            Path(args.metric_alerts_config).expanduser(),
+            max_series=args.metric_alerts_max_series,
+        )
     forwarding = None
     if not args.no_forwarding:
         forwarding = AgentForwardingRuntime(
@@ -200,6 +230,7 @@ def _runtime_for(store, args):
         openmetrics_worker=openmetrics,
         container_worker=containers,
         forwarding_worker=forwarding,
+        metric_alert_runtime=metric_alerts,
         self_metrics_interval_s=args.self_metrics_interval,
     )
 
@@ -215,7 +246,7 @@ def _run_agent(args):
     runtime = None
     snapshot = None
     log.info(
-        "starting headless agent; database=%s containers=%s dogstatsd=%s openmetrics=%s forwarding=%s",
+        "starting headless agent; database=%s containers=%s dogstatsd=%s openmetrics=%s alerts=%s forwarding=%s",
         database,
         "disabled" if args.no_container_metrics else f"{args.container_interval:g}s",
         "disabled"
@@ -224,6 +255,7 @@ def _run_agent(args):
         "disabled"
         if args.no_openmetrics
         else f"docker-autodiscovery/{args.openmetrics_discovery_interval:g}s",
+        "disabled" if args.metric_alerts_config is None else str(args.metric_alerts_config),
         "disabled" if args.no_forwarding else str(args.forwarding_config),
     )
     try:
@@ -284,13 +316,15 @@ def _run_agent(args):
     if snapshot is not None:
         log.info(
             "agent stopped; ticks=%d host_samples=%d system_points=%d "
-            "container_points=%d dogstatsd_points=%d openmetrics_points=%d self_points=%d",
+            "container_points=%d dogstatsd_points=%d openmetrics_points=%d "
+            "alerts=%d self_points=%d",
             snapshot.ticks,
             snapshot.host_samples_persisted,
             snapshot.system_points_persisted,
             snapshot.container_points_persisted,
             snapshot.statsd_points_persisted,
             snapshot.openmetrics_points_persisted,
+            snapshot.alert_events_persisted,
             snapshot.self_points_persisted,
         )
     return 0
@@ -312,6 +346,8 @@ def main(argv=None):
         p.error("intervals must be positive")
     if args.container_max <= 0:
         p.error("--container-max must be positive")
+    if args.metric_alerts_max_series <= 0:
+        p.error("--metric-alerts-max-series must be positive")
     if not 0 <= args.dogstatsd_port <= 65535:
         p.error("--dogstatsd-port must be in [0, 65535]")
     logging.basicConfig(
