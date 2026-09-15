@@ -13,10 +13,21 @@ class StatsDMetricsTests(unittest.TestCase):
             AggregatedMetric("temperature", "gauge", ("env:test",), 10.0, {"value": 7.5}),
             AggregatedMetric("requests", "count", (), 10.0, {"value": 3.0}),
             AggregatedMetric("users", "set", (), 10.0, {"count": 2.0}),
-            AggregatedMetric("latency", "histogram", (), 10.0, {
-                "count": 2.0, "min": 1.0, "max": 3.0, "sum": 4.0,
-                "mean": 2.0, "p50": 2.0, "p95": 2.9,
-            }),
+            AggregatedMetric(
+                "latency",
+                "histogram",
+                (),
+                10.0,
+                {
+                    "count": 2.0,
+                    "min": 1.0,
+                    "max": 3.0,
+                    "sum": 4.0,
+                    "mean": 2.0,
+                    "p50": 2.0,
+                    "p95": 2.9,
+                },
+            ),
         ]
         points = normalize_statsd_metrics(metrics)
         by_name = {point.name: point for point in points}
@@ -50,6 +61,26 @@ class StatsDMetricsTests(unittest.TestCase):
         worker.requeue_points(points)
         restored = worker.drain_points(10)
         self.assertEqual(restored, points)
+
+    def test_snapshot_exposes_aggregation_resource_drops(self):
+        aggregator = StatsDAggregator(
+            max_series=2,
+            max_histogram_values=1,
+            max_set_values=1,
+        )
+        server = StatsDUDPServer(port=0, aggregator=aggregator)
+        worker = StatsDMetricsWorker(server=server)
+        self.assertTrue(aggregator.ingest("latency:1|h"))
+        self.assertFalse(aggregator.ingest("latency:2|h"))
+        self.assertTrue(aggregator.ingest("users:a|s"))
+        self.assertFalse(aggregator.ingest("users:b|s"))
+        self.assertFalse(aggregator.ingest("overflow:1|c"))
+        snapshot = worker.snapshot()
+        self.assertEqual(snapshot.accepted_lines, 2)
+        self.assertEqual(snapshot.pending_series, 2)
+        self.assertEqual(snapshot.dropped_series, 1)
+        self.assertEqual(snapshot.dropped_histogram_values, 1)
+        self.assertEqual(snapshot.dropped_set_values, 1)
 
 
 if __name__ == "__main__":

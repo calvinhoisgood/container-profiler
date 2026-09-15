@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .custom_metrics import BoundedMetricBuffer, CustomMetricPoint, MetricBufferStats
-from .statsd import AggregatedMetric
+from .statsd import AggregatedMetric, StatsDAggregator
 from .statsd_server import StatsDUDPServer
 
 
-def normalize_statsd_metrics(metrics: Iterable[AggregatedMetric]) -> tuple[CustomMetricPoint, ...]:
+def normalize_statsd_metrics(
+    metrics: Iterable[AggregatedMetric],
+) -> tuple[CustomMetricPoint, ...]:
     """Normalize one aggregator flush without inventing unsupported semantics."""
     points: list[CustomMetricPoint] = []
     for metric in metrics:
@@ -20,11 +22,32 @@ def normalize_statsd_metrics(metrics: Iterable[AggregatedMetric]) -> tuple[Custo
             target_key="local-dogstatsd",
         )
         if metric.metric_type == "gauge":
-            points.append(CustomMetricPoint(name=metric.name, value=float(metric.values["value"]), metric_type="gauge", **common))
+            points.append(
+                CustomMetricPoint(
+                    name=metric.name,
+                    value=float(metric.values["value"]),
+                    metric_type="gauge",
+                    **common,
+                )
+            )
         elif metric.metric_type == "count":
-            points.append(CustomMetricPoint(name=metric.name, value=float(metric.values["value"]), metric_type="count", **common))
+            points.append(
+                CustomMetricPoint(
+                    name=metric.name,
+                    value=float(metric.values["value"]),
+                    metric_type="count",
+                    **common,
+                )
+            )
         elif metric.metric_type == "set":
-            points.append(CustomMetricPoint(name=f"{metric.name}.cardinality", value=float(metric.values["count"]), metric_type="gauge", **common))
+            points.append(
+                CustomMetricPoint(
+                    name=f"{metric.name}.cardinality",
+                    value=float(metric.values["count"]),
+                    metric_type="gauge",
+                    **common,
+                )
+            )
         else:
             # Keep the aggregate explicit. A percentile is a gauge; count/sum are
             # flush-window aggregates rather than cumulative host counters.
@@ -32,12 +55,16 @@ def normalize_statsd_metrics(metrics: Iterable[AggregatedMetric]) -> tuple[Custo
                 value = metric.values.get(suffix)
                 if value is None:
                     continue
-                points.append(CustomMetricPoint(
-                    name=f"{metric.name}.{suffix}",
-                    value=float(value),
-                    metric_type="count" if suffix in {"count", "sum"} else "gauge",
-                    **common,
-                ))
+                points.append(
+                    CustomMetricPoint(
+                        name=f"{metric.name}.{suffix}",
+                        value=float(value),
+                        metric_type=(
+                            "count" if suffix in {"count", "sum"} else "gauge"
+                        ),
+                        **common,
+                    )
+                )
     return tuple(points)
 
 
@@ -51,10 +78,15 @@ class StatsDMetricsSnapshot:
     flush_count: int
     last_error: str | None
     buffer: MetricBufferStats
+    accepted_lines: int = 0
+    pending_series: int = 0
+    dropped_series: int = 0
+    dropped_histogram_values: int = 0
+    dropped_set_values: int = 0
 
 
 class StatsDMetricsWorker:
-    """Own a loopback UDP listener and a bounded handoff queue for persistence."""
+    """Own a loopback UDP listener and bounded aggregation/persistence queues."""
 
     def __init__(
         self,
@@ -64,6 +96,9 @@ class StatsDMetricsWorker:
         flush_interval_s: float = 10.0,
         max_points: int = 20_000,
         max_bytes: int = 16 * 1024 * 1024,
+        max_series: int = 10_000,
+        max_histogram_values: int = 4_096,
+        max_set_values: int = 4_096,
         server: StatsDUDPServer | None = None,
     ) -> None:
         self.buffer = BoundedMetricBuffer(max_points=max_points, max_bytes=max_bytes)
@@ -71,6 +106,11 @@ class StatsDMetricsWorker:
             host=host,
             port=port,
             flush_interval_s=flush_interval_s,
+            aggregator=StatsDAggregator(
+                max_series=max_series,
+                max_histogram_values=max_histogram_values,
+                max_set_values=max_set_values,
+            ),
             on_flush=self._on_flush,
         )
         if server is not None:
@@ -102,4 +142,9 @@ class StatsDMetricsWorker:
             flush_count=self.server.flush_count,
             last_error=self.server.last_error,
             buffer=self.buffer.stats(),
+            accepted_lines=aggregator.accepted,
+            pending_series=aggregator.pending_series,
+            dropped_series=aggregator.dropped_series,
+            dropped_histogram_values=aggregator.dropped_histogram_values,
+            dropped_set_values=aggregator.dropped_set_values,
         )
