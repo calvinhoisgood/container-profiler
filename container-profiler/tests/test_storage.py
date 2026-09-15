@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from profiler.core.alerting import AlertEvent, AlertStatus
 from profiler.core.storage import SQLiteTelemetryStore
 
 
@@ -46,6 +47,53 @@ class SQLiteTelemetryStoreTests(unittest.TestCase):
         with SQLiteTelemetryStore() as store:
             with self.assertRaises(KeyError):
                 store.finish_session("missing")
+
+    def test_alert_event_persistence_filters_and_acknowledgement(self):
+        with SQLiteTelemetryStore() as store:
+            store.start_session("s1", container_id="abc")
+            firing = AlertEvent(
+                timestamp=10.0, rule_name="cpu-hot", metric="cpu_percent",
+                severity="critical", previous=AlertStatus.OK,
+                current=AlertStatus.FIRING, value=95.0, message="cpu hot",
+            )
+            recovered = AlertEvent(
+                timestamp=20.0, rule_name="cpu-hot", metric="cpu_percent",
+                severity="critical", previous=AlertStatus.FIRING,
+                current=AlertStatus.OK, value=50.0, message="cpu recovered",
+            )
+            firing_id = store.append_alert_event(firing, session_id="s1", container_id="abc")
+            recovered_id = store.append_alert_event(recovered, session_id="s1", container_id="abc")
+
+            rows = store.query_alert_events(container_id="abc")
+            self.assertEqual([row["id"] for row in rows], [recovered_id, firing_id])
+            self.assertEqual(store.query_alert_events(current_status="firing")[0]["value"], 95.0)
+            self.assertEqual(store.query_alert_events(severity="critical", rule_name="cpu-hot")[0]["id"], recovered_id)
+            self.assertEqual(len(store.query_alert_events(acknowledged=False)), 2)
+
+            self.assertTrue(store.acknowledge_alert_event(
+                firing_id, acknowledged_by="operator", note="investigating",
+                acknowledged_at="2026-09-15T01:00:00+00:00",
+            ))
+            self.assertFalse(store.acknowledge_alert_event(firing_id))
+            acked = store.query_alert_events(acknowledged=True)
+            self.assertEqual(acked[0]["acknowledged_by"], "operator")
+            self.assertEqual(acked[0]["note"], "investigating")
+            self.assertEqual(len(store.query_alert_events(acknowledged=False)), 1)
+
+    def test_deleting_session_keeps_alert_audit_record(self):
+        with SQLiteTelemetryStore() as store:
+            store.start_session("s1", container_id="abc")
+            event = AlertEvent(
+                timestamp=10.0, rule_name="memory", metric="memory_percent",
+                severity="warning", previous=AlertStatus.OK,
+                current=AlertStatus.FIRING, value=90.0, message="memory high",
+            )
+            event_id = store.append_alert_event(event, session_id="s1", container_id="abc")
+            self.assertTrue(store.delete_session("s1"))
+            rows = store.query_alert_events()
+            self.assertEqual(rows[0]["id"], event_id)
+            self.assertIsNone(rows[0]["session_id"])
+            self.assertEqual(rows[0]["container_id"], "abc")
 
 
 class DataManagerPersistenceTests(unittest.TestCase):
