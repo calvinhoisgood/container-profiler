@@ -87,7 +87,12 @@ def _validate_endpoint(value: Any, *, allow_insecure_http: bool) -> str:
     return endpoint
 
 
-def _parse_headers(raw: Mapping[str, Any], env: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+def _parse_headers(
+    raw: Mapping[str, Any],
+    env: Mapping[str, str],
+    *,
+    require_environment_values: bool,
+) -> tuple[tuple[str, str], ...]:
     result: dict[str, str] = {}
     literal = raw.get("headers", {})
     if not isinstance(literal, Mapping):
@@ -103,11 +108,15 @@ def _parse_headers(raw: Mapping[str, Any], env: Mapping[str, str]) -> tuple[tupl
     if not isinstance(env_headers, Mapping):
         raise ForwardingConfigError("headers_from_env must be an object")
     for header, variable in env_headers.items():
-        if not isinstance(header, str) or not header.strip() or not isinstance(variable, str):
+        if not isinstance(header, str) or not header.strip() or not isinstance(variable, str) or not variable:
             raise ForwardingConfigError("headers_from_env must map header names to env variable names")
         value = env.get(variable)
         if value is None:
-            raise ForwardingConfigError(f"environment variable {variable!r} is not set")
+            if require_environment_values:
+                raise ForwardingConfigError(f"environment variable {variable!r} is not set")
+            # Disabled configuration is inert: validate the reference but do not
+            # require operators to export secrets until forwarding is enabled.
+            continue
         if "\n" in value or "\r" in value:
             raise ForwardingConfigError(f"environment variable {variable!r} contains a newline")
         result[header.strip()] = value
@@ -136,18 +145,26 @@ def parse_forwarding_config(
     if enabled:
         endpoint = _validate_endpoint(endpoint_raw, allow_insecure_http=allow_insecure)
     elif endpoint_raw is not None:
-        # Validate dormant configuration too; enabling it later should not
-        # suddenly activate an invalid endpoint.
         endpoint = _validate_endpoint(endpoint_raw, allow_insecure_http=allow_insecure)
 
-    headers = _parse_headers(raw, os.environ if env is None else env)
+    headers = _parse_headers(
+        raw,
+        os.environ if env is None else env,
+        require_environment_values=enabled,
+    )
     batch_points = _int_field(raw, "batch_points", 250, 1, 5000)
     max_payload_bytes = _int_field(
         raw, "max_payload_bytes", 1024 * 1024, 1024, 4 * 1024 * 1024
     )
     queue_max_bytes = _int_field(
-        raw, "queue_max_bytes", 256 * 1024 * 1024, max_payload_bytes, 4 * 1024 * 1024 * 1024
+        raw, "queue_max_bytes", 256 * 1024 * 1024,
+        max_payload_bytes, 4 * 1024 * 1024 * 1024,
     )
+    base_delay_s = _float_field(raw, "base_delay_s", 1.0, 0.1, 3600.0)
+    max_delay_s = _float_field(raw, "max_delay_s", 300.0, 0.1, 86400.0)
+    if max_delay_s < base_delay_s:
+        raise ForwardingConfigError("max_delay_s must be >= base_delay_s")
+
     return ForwardingConfig(
         enabled=enabled,
         metrics_endpoint=endpoint,
@@ -156,8 +173,8 @@ def parse_forwarding_config(
         max_payload_bytes=max_payload_bytes,
         timeout_s=_float_field(raw, "timeout_s", 5.0, 0.1, 120.0),
         poll_interval_s=_float_field(raw, "poll_interval_s", 1.0, 0.05, 60.0),
-        base_delay_s=_float_field(raw, "base_delay_s", 1.0, 0.1, 3600.0),
-        max_delay_s=_float_field(raw, "max_delay_s", 300.0, 0.1, 86400.0),
+        base_delay_s=base_delay_s,
+        max_delay_s=max_delay_s,
         jitter=_float_field(raw, "jitter", 0.2, 0.0, 1.0),
         queue_max_items=_int_field(raw, "queue_max_items", 50_000, 1, 5_000_000),
         queue_max_bytes=queue_max_bytes,
