@@ -1,4 +1,5 @@
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from profiler.core.host_monitor import (
     HostRawSample,
+    HostRuntimeWorker,
+    HostStats,
     LinuxProcHostBackend,
     NativeHostMonitor,
     WindowsNativeHostBackend,
@@ -141,6 +144,44 @@ class WindowsNativeBackendTests(unittest.TestCase):
         self.assertEqual(sample.memory_available_bytes, 6 * 1024**3)
         self.assertEqual(sample.uptime_s, 12.345)
         self.assertEqual(sample.logical_cpus, 16)
+
+
+class RepeatingMonitor:
+    def __init__(self):
+        self.calls = 0
+        self.last_error = None
+
+    def get_stats(self):
+        self.calls += 1
+        return HostStats(
+            timestamp=float(self.calls),
+            cpu_percent=25.0,
+            logical_cpus=4,
+            memory_total_mb=8192.0,
+            memory_available_mb=4096.0,
+            memory_used_mb=4096.0,
+            memory_percent=50.0,
+            uptime_s=100.0 + self.calls,
+        )
+
+
+class HostRuntimeWorkerTests(unittest.TestCase):
+    def test_worker_runs_without_container_selection_and_queue_is_bounded(self):
+        monitor = RepeatingMonitor()
+        worker = HostRuntimeWorker(monitor, interval_s=0.01, max_queue=2)
+        worker.start()
+        deadline = time.time() + 1.0
+        while time.time() < deadline and worker.snapshot().samples_collected < 3:
+            time.sleep(0.01)
+        snapshot = worker.snapshot()
+        self.assertGreaterEqual(snapshot.samples_collected, 3)
+        self.assertLessEqual(snapshot.queued_samples, 2)
+        self.assertGreaterEqual(snapshot.dropped_samples, 1)
+        drained = worker.drain(2)
+        self.assertGreaterEqual(len(drained), 1)
+        self.assertEqual(worker.requeue_front(drained), len(drained))
+        self.assertTrue(worker.stop(timeout_s=1.0))
+        self.assertFalse(worker.is_running())
 
 
 if __name__ == "__main__":
