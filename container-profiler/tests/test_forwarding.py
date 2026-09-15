@@ -27,12 +27,22 @@ class DurableDeliveryQueueTests(unittest.TestCase):
         with DurableDeliveryQueue(":memory:", max_items=3, max_bytes=8) as queue:
             for value in (b"aa", b"bb", b"cc", b"dddd"):
                 self.assertTrue(queue.enqueue("metrics", value))
+            # Limits are inclusive: exactly max_items and max_bytes is valid.
+            # Adding dddd takes the queue to 4 items / 10 bytes, so only the
+            # oldest aa must be evicted to reach 3 items / 8 bytes.
             items = queue.due(limit=10)
-            self.assertEqual([item.payload for item in items], [b"cc", b"dddd"])
+            self.assertEqual([item.payload for item in items], [b"bb", b"cc", b"dddd"])
             stats = queue.stats()
-            self.assertEqual(stats.queued_items, 2)
-            self.assertEqual(stats.queued_bytes, 6)
-            self.assertEqual(stats.dropped_items, 2)
+            self.assertEqual(stats.queued_items, 3)
+            self.assertEqual(stats.queued_bytes, 8)
+            self.assertEqual(stats.dropped_items, 1)
+
+    def test_exact_limits_do_not_evict_valid_items(self):
+        with DurableDeliveryQueue(":memory:", max_items=2, max_bytes=4) as queue:
+            queue.enqueue("metrics", b"aa")
+            queue.enqueue("metrics", b"bb")
+            self.assertEqual([item.payload for item in queue.due()], [b"aa", b"bb"])
+            self.assertEqual(queue.stats().dropped_items, 0)
 
     def test_oversized_payload_is_rejected_without_touching_existing_data(self):
         with DurableDeliveryQueue(":memory:", max_bytes=10, max_payload_bytes=4) as queue:
