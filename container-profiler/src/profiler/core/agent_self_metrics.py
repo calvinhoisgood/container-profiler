@@ -76,6 +76,40 @@ def normalize_agent_self_metrics(
             f"subsystem:{subsystem}",
         )
 
+    host_runtime = _get(snapshot, "host")
+    if host_runtime is not None:
+        for field, metric in (
+            ("samples_collected", "container_profiler.host.samples_collected"),
+            ("failed_samples", "container_profiler.host.failed_samples"),
+            ("queued_samples", "container_profiler.host.queued_samples"),
+            ("dropped_samples", "container_profiler.host.dropped_samples"),
+        ):
+            add(metric, _get(host_runtime, field))
+
+    system = _get(snapshot, "system")
+    if system is not None:
+        for field, metric in (
+            ("collections", "container_profiler.system.collections"),
+            ("failed_collections", "container_profiler.system.failed_collections"),
+            ("partial_collections", "container_profiler.system.partial_collections"),
+        ):
+            add(metric, _get(system, field))
+        add(
+            "container_profiler.system.buffer_dropped_points",
+            _get(system, "buffer", "dropped_points"),
+        )
+        for field, check in (
+            ("network_error", "network"),
+            ("disk_error", "disk"),
+            ("filesystem_error", "filesystem"),
+            ("process_error", "process"),
+        ):
+            add(
+                "container_profiler.system.check_error",
+                1 if _get(system, field) else 0,
+                f"check:{check}",
+            )
+
     statsd = _get(snapshot, "statsd")
     add("container_profiler.dogstatsd.parse_errors", _get(statsd, "parse_errors"))
     add("container_profiler.dogstatsd.dropped_series", _get(statsd, "dropped_series"))
