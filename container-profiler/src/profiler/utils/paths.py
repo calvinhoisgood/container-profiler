@@ -32,15 +32,20 @@ def get_output_dir() -> Path:
 
 
 def get_telemetry_db_path() -> Path:
-    """Return the durable local telemetry database path.
-
-    Keeping the database in the user state directory makes source and
-    PyInstaller builds share the same history without requiring write access to
-    the installation directory.
-    """
+    """Return the durable local telemetry database path."""
     return get_config_dir() / "telemetry.sqlite3"
 
 
 def get_alert_config_path() -> Path:
     """Return the per-user JSON threshold-alert configuration path."""
     return get_config_dir() / "alerts.json"
+
+
+def get_forwarding_config_path() -> Path:
+    """Return the disabled-by-default remote forwarding configuration path."""
+    return get_config_dir() / "forwarding.json"
+
+
+def get_forwarding_db_path() -> Path:
+    """Return the durable bounded outbound spool path."""
+    return get_config_dir() / "forwarding.sqlite3"
