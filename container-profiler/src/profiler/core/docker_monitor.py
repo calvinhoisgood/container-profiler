@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Optional
 
+from .container_context import extract_container_template_context
 from .discovery import DockerEventWatcher, extract_container_metadata
 from .models import ContainerInfo, ContainerStats
 
@@ -92,6 +93,7 @@ class DockerMonitor:
                     container_name=name,
                     image=image,
                 )
+                context = extract_container_template_context(attrs)
                 result.append(
                     ContainerInfo(
                         id=str(getattr(container, "short_id", None) or container.id),
@@ -104,6 +106,11 @@ class DockerMonitor:
                         env=metadata.env,
                         service=metadata.service,
                         version=metadata.version,
+                        primary_host=context.primary_host,
+                        network_hosts=context.network_hosts,
+                        exposed_ports=context.ports,
+                        hostname=context.hostname,
+                        pid=context.pid,
                     )
                 )
             self.last_error = None
