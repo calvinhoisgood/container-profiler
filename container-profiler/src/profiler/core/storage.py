@@ -1,4 +1,4 @@
-"""Durable local telemetry, alert, and custom-metric store backed by SQLite.
+"""Durable local telemetry, alert, custom-metric, and host store backed by SQLite.
 
 The store is intentionally independent from Qt and Docker so it can be used by
 future agent/service and GUI processes. WAL mode allows a writer and explorers
@@ -14,10 +14,11 @@ from typing import Any, Iterable, Mapping
 
 from .alerting import AlertEvent
 from .custom_metrics import CustomMetricPoint
+from .host_monitor import HostStats
 
 
 class SQLiteTelemetryStore:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
@@ -119,6 +120,22 @@ class SQLiteTelemetryStore:
                 ON custom_metrics(container_id, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_custom_metrics_target_timestamp
                 ON custom_metrics(target_key, timestamp DESC);
+            CREATE TABLE IF NOT EXISTS host_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                cpu_percent REAL,
+                logical_cpus INTEGER NOT NULL,
+                memory_total_mb REAL NOT NULL,
+                memory_available_mb REAL NOT NULL,
+                memory_used_mb REAL NOT NULL,
+                memory_percent REAL NOT NULL,
+                uptime_s REAL NOT NULL,
+                load_1 REAL,
+                load_5 REAL,
+                load_15 REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_host_samples_timestamp
+                ON host_samples(timestamp DESC, id DESC);
             """
         )
         self._db.execute(
@@ -242,7 +259,6 @@ class SQLiteTelemetryStore:
         session_id: str | None = None,
         container_id: str | None = None,
     ) -> int:
-        """Persist one alert state transition and return its stable event id."""
         with self._db:
             cursor = self._db.execute(
                 """
@@ -252,16 +268,9 @@ class SQLiteTelemetryStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    session_id,
-                    container_id,
-                    float(event.timestamp),
-                    event.rule_name,
-                    event.metric,
-                    event.severity,
-                    event.previous.value,
-                    event.current.value,
-                    event.value,
-                    event.message,
+                    session_id, container_id, float(event.timestamp), event.rule_name,
+                    event.metric, event.severity, event.previous.value, event.current.value,
+                    event.value, event.message,
                 ),
             )
         return int(cursor.lastrowid)
@@ -277,16 +286,13 @@ class SQLiteTelemetryStore:
         acknowledged: bool | None = None,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        """Return newest alert transitions matching bounded explorer filters."""
         if limit <= 0:
             return []
         clauses: list[str] = []
         params: list[Any] = []
         for column, value in (
-            ("session_id", session_id),
-            ("container_id", container_id),
-            ("rule_name", rule_name),
-            ("severity", severity),
+            ("session_id", session_id), ("container_id", container_id),
+            ("rule_name", rule_name), ("severity", severity),
             ("current_status", current_status),
         ):
             if value is not None:
@@ -315,13 +321,11 @@ class SQLiteTelemetryStore:
         note: str | None = None,
         acknowledged_at: str | None = None,
     ) -> bool:
-        """Acknowledge one transition once; repeated acknowledgement is idempotent."""
         when = acknowledged_at or datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         with self._db:
             cursor = self._db.execute(
                 """
-                UPDATE alert_events
-                SET acknowledged_at=?, acknowledged_by=?, note=?
+                UPDATE alert_events SET acknowledged_at=?, acknowledged_by=?, note=?
                 WHERE id=? AND acknowledged_at IS NULL
                 """,
                 (when, acknowledged_by, note, int(event_id)),
@@ -329,22 +333,14 @@ class SQLiteTelemetryStore:
         return cursor.rowcount == 1
 
     def append_custom_metrics(self, points: Iterable[CustomMetricPoint]) -> int:
-        """Persist one bounded batch of normalized custom metric points."""
-        rows = []
-        for point in points:
-            rows.append(
-                (
-                    float(point.timestamp),
-                    point.name,
-                    float(point.value),
-                    point.metric_type,
-                    point.unit,
-                    point.source,
-                    point.target_key,
-                    point.container_id,
-                    json.dumps(point.tags, ensure_ascii=False, separators=(",", ":")),
-                )
+        rows = [
+            (
+                float(point.timestamp), point.name, float(point.value), point.metric_type,
+                point.unit, point.source, point.target_key, point.container_id,
+                json.dumps(point.tags, ensure_ascii=False, separators=(",", ":")),
             )
+            for point in points
+        ]
         if not rows:
             return 0
         with self._db:
@@ -371,25 +367,19 @@ class SQLiteTelemetryStore:
         end_timestamp: float | None = None,
         limit: int = 2000,
     ) -> list[dict[str, Any]]:
-        """Return newest custom points matching indexed, bounded filters."""
         if limit <= 0:
             return []
-        if limit > 10_000:
-            limit = 10_000
+        limit = min(limit, 10_000)
         clauses: list[str] = []
         params: list[Any] = []
         for column, value in (
-            ("name", name),
-            ("container_id", container_id),
-            ("target_key", target_key),
-            ("source", source),
+            ("name", name), ("container_id", container_id),
+            ("target_key", target_key), ("source", source),
         ):
             if value is not None:
                 clauses.append(f"{column}=?")
                 params.append(value)
         if name_prefix is not None:
-            # Escape SQL LIKE metacharacters so this remains a prefix filter,
-            # not an accidental wildcard query controlled by UI text.
             escaped = name_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append("name LIKE ? ESCAPE '\\'")
             params.append(escaped + "%")
@@ -417,12 +407,7 @@ class SQLiteTelemetryStore:
             result.append(item)
         return result
 
-    def list_custom_metric_names(
-        self,
-        *,
-        prefix: str = "",
-        limit: int = 200,
-    ) -> list[str]:
+    def list_custom_metric_names(self, *, prefix: str = "", limit: int = 200) -> list[str]:
         if limit <= 0:
             return []
         escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -439,15 +424,13 @@ class SQLiteTelemetryStore:
         before_timestamp: float | None = None,
         max_rows: int | None = None,
     ) -> int:
-        """Apply age and row-count retention, returning deleted row count."""
         if max_rows is not None and max_rows < 0:
             raise ValueError("max_rows must be >= 0")
         deleted = 0
         with self._db:
             if before_timestamp is not None:
                 cursor = self._db.execute(
-                    "DELETE FROM custom_metrics WHERE timestamp<?",
-                    (float(before_timestamp),),
+                    "DELETE FROM custom_metrics WHERE timestamp<?", (float(before_timestamp),)
                 )
                 deleted += cursor.rowcount
             if max_rows is not None:
@@ -456,8 +439,88 @@ class SQLiteTelemetryStore:
                 if excess:
                     cursor = self._db.execute(
                         "DELETE FROM custom_metrics WHERE id IN ("
-                        "SELECT id FROM custom_metrics ORDER BY timestamp ASC, id ASC LIMIT ?"
-                        ")",
+                        "SELECT id FROM custom_metrics ORDER BY timestamp ASC, id ASC LIMIT ?)",
+                        (excess,),
+                    )
+                    deleted += cursor.rowcount
+        return deleted
+
+    def append_host_samples(self, samples: Iterable[HostStats]) -> int:
+        rows = [
+            (
+                float(sample.timestamp), sample.cpu_percent, int(sample.logical_cpus),
+                float(sample.memory_total_mb), float(sample.memory_available_mb),
+                float(sample.memory_used_mb), float(sample.memory_percent),
+                float(sample.uptime_s), sample.load_1, sample.load_5, sample.load_15,
+            )
+            for sample in samples
+        ]
+        if not rows:
+            return 0
+        with self._db:
+            self._db.executemany(
+                """
+                INSERT INTO host_samples(
+                    timestamp, cpu_percent, logical_cpus, memory_total_mb,
+                    memory_available_mb, memory_used_mb, memory_percent, uptime_s,
+                    load_1, load_5, load_15
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def query_host_samples(
+        self,
+        *,
+        start_timestamp: float | None = None,
+        end_timestamp: float | None = None,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        limit = min(limit, 10_000)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if start_timestamp is not None:
+            clauses.append("timestamp>=?")
+            params.append(float(start_timestamp))
+        if end_timestamp is not None:
+            clauses.append("timestamp<=?")
+            params.append(float(end_timestamp))
+        where = "" if not clauses else "WHERE " + " AND ".join(clauses)
+        params.append(int(limit))
+        rows = self._db.execute(
+            "SELECT id, timestamp, cpu_percent, logical_cpus, memory_total_mb, "
+            "memory_available_mb, memory_used_mb, memory_percent, uptime_s, "
+            f"load_1, load_5, load_15 FROM host_samples {where} "
+            "ORDER BY timestamp DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_host_samples(
+        self,
+        *,
+        before_timestamp: float | None = None,
+        max_rows: int | None = None,
+    ) -> int:
+        if max_rows is not None and max_rows < 0:
+            raise ValueError("max_rows must be >= 0")
+        deleted = 0
+        with self._db:
+            if before_timestamp is not None:
+                cursor = self._db.execute(
+                    "DELETE FROM host_samples WHERE timestamp<?", (float(before_timestamp),)
+                )
+                deleted += cursor.rowcount
+            if max_rows is not None:
+                count = int(self._db.execute("SELECT COUNT(*) FROM host_samples").fetchone()[0])
+                excess = max(0, count - int(max_rows))
+                if excess:
+                    cursor = self._db.execute(
+                        "DELETE FROM host_samples WHERE id IN ("
+                        "SELECT id FROM host_samples ORDER BY timestamp ASC, id ASC LIMIT ?)",
                         (excess,),
                     )
                     deleted += cursor.rowcount
